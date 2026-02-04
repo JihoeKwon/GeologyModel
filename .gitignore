@@ -1,0 +1,49 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+venv/
+ENV/
+
+# API keys and secrets
+config.yaml
+
+# Data files (large)
+*.zip
+*.img
+*.tif
+*.tiff
+*.shp
+*.shx
+*.dbf
+*.prj
+*.cpg
+*.sbn
+*.sbx
+*.jpg
+*.png
+*.pdf
+*.hwp
+
+# Output files
+output/
+*.json
+*_ocr_text.txt
+
+# Temp files
+_temp_*
+*.tmp
+
+# IDE
+.vscode/
+.idea/
+*.swp
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Backup
+backup/
