@@ -112,10 +112,24 @@ def analyze_sections_node(state: GeologyAgentState) -> Dict[str, Any]:
     data_dir = data_paths.get("data_dir")
     output_dir = data_paths.get("output_dir")
 
+    # config.yaml에서 max_boundaries 읽기
+    try:
+        import yaml
+        from pathlib import Path
+        cfg_path = Path(data_dir).parent.parent / "config.yaml" if data_dir else None
+        if cfg_path and cfg_path.exists():
+            with open(cfg_path, 'r', encoding='utf-8') as f:
+                cfg = yaml.safe_load(f)
+            max_bounds = cfg.get('analysis', {}).get('max_boundaries', 20)
+        else:
+            max_bounds = 20
+    except Exception:
+        max_bounds = 20
+
     result = analyze_sections(
         data_dir=data_dir,
         output_dir=output_dir,
-        max_boundaries=5,
+        max_boundaries=max_bounds,
         geology_dir=data_paths.get("geology_dir"),
         dem_file=data_paths.get("dem_file"),
         dem_dir=data_paths.get("dem_dir"),
