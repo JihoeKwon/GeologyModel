@@ -15,6 +15,7 @@ from rasterio.transform import rowcol
 from shapely.geometry import LineString, Point
 from pathlib import Path
 from typing import List, Dict, Tuple, Optional
+from pyproj import CRS, Transformer
 import anthropic
 import yaml
 import os
@@ -36,38 +37,107 @@ OUTPUT_DIR = PATHS['output_dir']
 
 TARGET_CRS = CONFIG['crs']
 
-# Add SeoulData to path for knowledge base import
-sys.path.insert(0, str(PATHS['data_dir']))
-try:
-    from seoul_geological_knowledge import (
-        ROCK_UNITS, STRUCTURAL_GEOLOGY, CONTACT_RULES,
-        DIP_ESTIMATION_RULES, get_contact_type, get_expected_dip_range,
-        generate_context_for_boundary, generate_regional_context
-    )
-    KNOWLEDGE_BASE_LOADED = True
-    print("  Seoul geological knowledge base loaded successfully.")
-except ImportError:
-    KNOWLEDGE_BASE_LOADED = False
-    print("  Warning: Seoul geological knowledge base not found. Using default context.")
-
+# 지역명 (reconfigure()로 업데이트됨)
+REGION_NAME_KR = "서울"
+REGION_NAME_EN = "Seoul"
 
 # =============================================================================
-# 지질학 컨텍스트 (LLM에게 제공) - 지식베이스에서 동적 생성
+# 지식베이스 동적 로딩
 # =============================================================================
 
-# 지식베이스가 로드되면 동적으로 생성, 아니면 기본값 사용
-if KNOWLEDGE_BASE_LOADED:
-    GEOLOGICAL_CONTEXT = generate_regional_context()
-else:
-    GEOLOGICAL_CONTEXT = """
-# 서울 지역 지질 개요
-- 위치: 경기육괴 중앙부
-- 주요 구조 방향: NE-SW
-- 선캠브리아기 변성암류와 중생대 화강암류가 주요 암석
+KNOWLEDGE_BASE_LOADED = False
+generate_context_for_boundary = None
+generate_regional_context = None
+
+DEFAULT_GEOLOGICAL_CONTEXT = """
+# 지질 개요
 - 정합적 접촉: 40-70° 경사
 - 관입 접촉: 70-90° 급경사
 - 부정합 접촉: 0-15° 수평
 """
+
+GEOLOGICAL_CONTEXT = DEFAULT_GEOLOGICAL_CONTEXT
+
+
+def _dict_context_to_str(ctx_dict):
+    """지식베이스 dict를 LLM 프롬프트용 텍스트로 변환"""
+    lines = []
+    for key, value in ctx_dict.items():
+        title = key.replace('_', ' ').title()
+        lines.append(f"\n## {title}")
+        if isinstance(value, dict):
+            for k, v in value.items():
+                lines.append(f"- **{k}**: {v}")
+        elif isinstance(value, list):
+            for item in value:
+                if isinstance(item, dict):
+                    for k, v in item.items():
+                        lines.append(f"- {k}: {v}")
+                else:
+                    lines.append(f"- {item}")
+        else:
+            lines.append(str(value))
+    return '\n'.join(lines)
+
+
+def load_knowledge_base(data_dir=None):
+    """지역별 지식베이스 동적 로딩"""
+    global KNOWLEDGE_BASE_LOADED, generate_context_for_boundary, generate_regional_context, GEOLOGICAL_CONTEXT
+
+    search_dir = data_dir or str(PATHS['data_dir'])
+    if str(search_dir) not in sys.path:
+        sys.path.insert(0, str(search_dir))
+
+    # data_dir 내 *_geological_knowledge*.py 파일 찾기
+    import glob
+    kb_files = glob.glob(str(Path(search_dir) / "*geological_knowledge*.py"))
+    # auto 생성본 제외, 원본 우선
+    kb_files = [f for f in kb_files if '_auto' not in f and '_vision' not in f]
+    if not kb_files:
+        # auto 버전이라도 사용
+        kb_files = glob.glob(str(Path(search_dir) / "*geological_knowledge*.py"))
+
+    if kb_files:
+        kb_path = Path(kb_files[0])
+        module_name = kb_path.stem
+        try:
+            import importlib
+            if module_name in sys.modules:
+                # 이미 로드된 모듈이면 리로드
+                mod = importlib.reload(sys.modules[module_name])
+            else:
+                spec = importlib.util.spec_from_file_location(module_name, str(kb_path))
+                mod = importlib.util.module_from_spec(spec)
+                sys.modules[module_name] = mod
+                spec.loader.exec_module(mod)
+
+            generate_context_for_boundary = getattr(mod, 'generate_context_for_boundary', None)
+            generate_regional_context = getattr(mod, 'generate_regional_context', None)
+            KNOWLEDGE_BASE_LOADED = True
+
+            if generate_regional_context:
+                ctx = generate_regional_context()
+                # dict 반환 시 LLM 프롬프트용 텍스트로 변환
+                if isinstance(ctx, dict):
+                    GEOLOGICAL_CONTEXT = _dict_context_to_str(ctx)
+                elif isinstance(ctx, str):
+                    GEOLOGICAL_CONTEXT = ctx
+                else:
+                    GEOLOGICAL_CONTEXT = str(ctx)
+
+            print(f"  Knowledge base loaded: {kb_path.name}")
+            return True
+        except Exception as e:
+            print(f"  Warning: Failed to load knowledge base {kb_path.name}: {e}")
+
+    KNOWLEDGE_BASE_LOADED = False
+    GEOLOGICAL_CONTEXT = DEFAULT_GEOLOGICAL_CONTEXT
+    print(f"  Warning: No knowledge base found in {search_dir}. Using default context.")
+    return False
+
+
+# 초기 로딩 (서버 시작 시 기본 data_dir에서)
+load_knowledge_base()
 
 
 # =============================================================================
@@ -79,7 +149,8 @@ def load_data():
     print("Loading geological data...")
     shp_paths = CONFIG['shapefile_paths']
     data = {}
-    data['litho'] = gpd.read_file(shp_paths['litho']).to_crs(TARGET_CRS)
+    from config_loader import read_shapefile_safe
+    data['litho'] = read_shapefile_safe(shp_paths['litho'], target_crs=TARGET_CRS)
     data['boundary'] = gpd.read_file(shp_paths['boundary']).to_crs(TARGET_CRS)
     data['fault'] = gpd.read_file(shp_paths['fault']).to_crs(TARGET_CRS)
     data['foliation'] = gpd.read_file(shp_paths['foliation']).to_crs(TARGET_CRS)
@@ -113,13 +184,22 @@ def get_boundary_data(boundary_geom, litho_gdf, dem_path, sample_interval=100):
         transform = dem.transform
         nodata = dem.nodata
 
+        # DEM CRS와 TARGET_CRS가 다르면 좌표 변환 준비
+        dem_crs = CRS(dem.crs) if dem.crs else None
+        target_crs = CRS(TARGET_CRS)
+        need_transform = dem_crs is not None and dem_crs != target_crs
+        if need_transform:
+            coord_transformer = Transformer.from_crs(target_crs, dem_crs, always_xy=True)
+
         for i in range(num_samples + 1):
             fraction = i / num_samples
             point = line.interpolate(fraction, normalized=True)
             x, y = point.x, point.y
 
             try:
-                row, col = rowcol(transform, x, y)
+                # TARGET_CRS → DEM CRS 변환 (필요 시)
+                dx, dy = coord_transformer.transform(x, y) if need_transform else (x, y)
+                row, col = rowcol(transform, dx, dy)
                 if 0 <= row < dem.height and 0 <= col < dem.width:
                     elev = dem_data[row, col]
                     if nodata and elev == nodata:
@@ -235,7 +315,7 @@ class LLMGeologistAgent:
         print(f"  Model: {self.model}")
         print(f"  Max boundaries to analyze: {self.max_boundaries}")
         print(f"  System persona: {'Loaded' if self.system_prompt else 'Not configured'}")
-        print(f"  Knowledge base: {'Seoul geological KB active' if KNOWLEDGE_BASE_LOADED else 'Default context only'}")
+        print(f"  Knowledge base: {'Loaded' if KNOWLEDGE_BASE_LOADED else 'Default context only'}")
 
     def load_data(self):
         """Load geological data"""
@@ -251,10 +331,13 @@ class LLMGeologistAgent:
 {GEOLOGICAL_CONTEXT}
 """
         # Add dynamic knowledge base context if available
-        if KNOWLEDGE_BASE_LOADED:
+        if KNOWLEDGE_BASE_LOADED and generate_context_for_boundary:
             lithologies = boundary_data.get('adjacent_lithologies', [])
             dynamic_context = generate_context_for_boundary(lithologies)
             if dynamic_context:
+                # dict 반환 시 텍스트로 변환
+                if isinstance(dynamic_context, dict):
+                    dynamic_context = _dict_context_to_str(dynamic_context)
                 prompt += f"""
 ## Specific Knowledge for This Boundary
 {dynamic_context}
@@ -328,9 +411,9 @@ Consider:
 1. **Contact type & 3D geometry**: Is this a planar contact or does it curve at depth?
 2. **Intrusion mechanics**: If intrusive, what shape? Granite batholiths often have outward-dipping contacts (~70-80°) that may steepen or flatten with depth
 3. **Depth behavior**: Do contacts typically steepen (listric) or flatten (sole out) at depth?
-4. **Fold influence**: Is there evidence of folding affecting this contact? Seoul area has 4 phases of deformation
+4. **Fold influence**: Is there evidence of folding affecting this contact?
 5. **V-rule & elevation profile**: What does the topographic expression tell us about geometry?
-6. **Regional structure**: NE-SW dominant trend, SE-dipping foliations (40-50°)
+6. **Regional structure**: Consider the dominant structural trends of this area
 
 Respond ONLY with the JSON object, no additional text."""
 

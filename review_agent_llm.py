@@ -97,16 +97,9 @@ class GeologyReviewAgent:
 | **Pgr** | 반상화강암 | **연한 주황색** | #FFA07A |
 | **Kfl** | 규장암 | **갈색-분홍** | #BC8F8F |
 
-**중요 - 반드시 숙지하세요**:
-- **충적층(Qa)은 오직 밝은 노란색(순수 노랑, #FFFF00)만** 해당합니다!
-- 자주색/보라색(PCEggn), 분홍색(PCEbngn), 주황색(Jbgr) 등은 충적층이 **아닙니다**!
-- 충적층은 지표면 근처에 렌즈형으로 얇게(10-30m) 표시되어 있습니다.
-
 **회색/빈 공간에 대한 설명**:
 - 지하 깊은 곳의 **회색 영역(#D3D3D3)**은 **미분화 기반암(undifferentiated basement)**입니다.
-- 이 회색 영역은 **충적층이 아닙니다**! 지하 심부의 불확실한 지질을 나타냅니다.
-- 암석 단위들 사이의 빈 공간/회색 영역은 "모르는 영역"이지 충적층이 침투한 것이 아닙니다.
-- 충적층은 **오직 지표면에서만** 연한 노란색으로 표시됩니다.
+- 암석 단위들 사이의 빈 공간/회색 영역은 "모르는 영역"입니다.
 
 ## 검토 요청사항
 
@@ -114,14 +107,11 @@ class GeologyReviewAgent:
 당신의 전문 지식과 경험을 바탕으로 이 단면도를 **엄격하고 비판적으로** 검토해주세요.
 
 **색상을 정확히 구분하여** 다음 사항을 중점 확인하세요:
-1. **충적층(Qa, 연한 노란색/레몬색만!)**: 지표면을 따라 렌즈형으로 얇게 덮여 있는가?
-   - ⚠️ **주의**: 지하의 회색 영역은 충적층이 아닙니다! 회색은 미분화 기반암입니다.
-   - ⚠️ **주의**: 충적층이 "지하 깊이 침투"했다고 판단하기 전에, 그 영역이 정말 연한 노란색인지 확인하세요.
-2. **관입체 형태 (Jbgr=토마토색, Pgr=주황색)**: 현실적인 저반/암주 형태인가? 완벽한 수직벽으로 되어있지 않은가?
+1. **관입체 형태 (Jbgr=토마토색, Pgr=주황색)**: 현실적인 저반/암주 형태인가? 완벽한 수직벽으로 되어있지 않은가?
    - 단면도에 수직과장(vertical exaggeration)이 있어 실제보다 가파르게 보일 수 있습니다.
-3. **변성암 (PCEbngn=분홍색, PCEggn=자주색)**: 엽리 방향이 일관적인가?
-4. **접촉 관계**: 층서적 원리에 맞는가?
-5. **미분화 기반암 (회색 영역)**: 지하 깊은 곳의 불확실한 지질을 나타내며, 이는 정상적인 표현입니다.
+2. **변성암 (PCEbngn=분홍색, PCEggn=자주색)**: 엽리 방향이 일관적인가?
+3. **접촉 관계**: 층서적 원리에 맞는가?
+4. **미분화 기반암 (회색 영역)**: 지하 깊은 곳의 불확실한 지질을 나타내며, 이는 정상적인 표현입니다.
 
 다음 JSON 형식으로 응답해주세요:
 
@@ -138,15 +128,6 @@ class GeologyReviewAgent:
             "geological_principle": "<위반된 지질학 원리>"
         }}
     ],
-
-    "alluvium_review": {{
-        "is_correct": <true/false>,
-        "correctly_identified_yellow_only": <true/false>,
-        "gray_areas_confused_with_alluvium": <true/false>,
-        "issues": ["<충적층 표현 문제점들 - 연한 노란색 영역만 해당>"],
-        "suggestions": ["<개선 제안>"],
-        "note": "<회색 영역은 미분화 기반암이며 충적층이 아님을 인지했는지>"
-    }},
 
     "intrusion_review": {{
         "shapes_realistic": <true/false>,
@@ -193,7 +174,7 @@ class GeologyReviewAgent:
 ```
 
 이미지를 면밀히 분석하고, 지질학적 타당성을 중심으로 검토해주세요.
-특히 **충적층(Qa, 연한 노란색)이 지표면을 따라 올바르게 표현되었는지** 주의 깊게 확인해주세요.
+각 암석 단위의 접촉 관계와 기하학적 타당성을 중심으로 검토해주세요.
 """
 
         return prompt
@@ -356,13 +337,6 @@ class GeologyReviewAgent:
             lines.append(f"\n--- {r.get('section_name', 'Unknown')} ---")
             lines.append(f"점수: {r.get('overall_score', 0)}/10 ({r.get('overall_assessment', '?')})")
             lines.append(f"\n요약: {r.get('summary_korean', '')}")
-
-            # Alluvium review
-            alluvium = r.get('alluvium_review', {})
-            if not alluvium.get('is_correct', True):
-                lines.append(f"\n[충적층 문제]")
-                for issue in alluvium.get('issues', []):
-                    lines.append(f"  - {issue}")
 
             # Recommendations
             recs = r.get('specific_recommendations', [])
@@ -757,17 +731,6 @@ class GeologyReviewAgent:
             html += f"""
                     <div class="review-summary">{summary}</div>
 """
-
-            # Alluvium review
-            alluvium = r.get('alluvium_review', {})
-            if not alluvium.get('is_correct', True):
-                html += """
-                    <div class="sub-section">
-                        <h4>🏔️ 충적층 문제 (Alluvium Issues)</h4>
-"""
-                for issue in alluvium.get('issues', []):
-                    html += f'<p style="color: var(--danger);">• {issue}</p>'
-                html += "</div>"
 
             # Recommendations
             recs = r.get('specific_recommendations', [])

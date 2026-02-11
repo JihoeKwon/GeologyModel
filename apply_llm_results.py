@@ -3,6 +3,7 @@ Apply AI Geologist Results to Cross-Sections and Generate HTML Report
 AI 분석 결과를 단면도에 적용 및 HTML 보고서 생성
 """
 
+import os
 import sys
 import io
 sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding='utf-8')
@@ -14,6 +15,7 @@ import rasterio
 from rasterio.transform import rowcol
 from shapely.geometry import LineString, Point
 from pathlib import Path
+from pyproj import CRS, Transformer
 import matplotlib.pyplot as plt
 import matplotlib.patches as mpatches
 from matplotlib.collections import PatchCollection
@@ -35,6 +37,10 @@ DEM_FILE = PATHS['dem_file']
 OUTPUT_DIR = PATHS['output_dir']
 
 TARGET_CRS = CONFIG['crs']
+
+# 지역명 (reconfigure()로 업데이트됨)
+REGION_NAME_KR = "서울"
+REGION_NAME_EN = "Seoul"
 
 # Korean font
 viz_params = CONFIG['visualization']
@@ -81,13 +87,21 @@ LITHO_AGE_ORDER = {
 
 def load_data():
     """Load all required data"""
+    global LITHO_COLORS, LITHO_NAMES, LITHO_AGE_ORDER
     print("Loading data...")
 
     shp_paths = CONFIG['shapefile_paths']
     data = {}
-    data['litho'] = gpd.read_file(shp_paths['litho']).to_crs(TARGET_CRS)
+
+    # read_shapefile_safe: SHAPE_ENCODING='' 로 인코딩 자동감지
+    from config_loader import read_shapefile_safe, auto_populate_litho_info, auto_populate_age_order
+    data['litho'] = read_shapefile_safe(shp_paths['litho'], target_crs=TARGET_CRS)
     data['boundary'] = gpd.read_file(shp_paths['boundary']).to_crs(TARGET_CRS)
     data['fault'] = gpd.read_file(shp_paths['fault']).to_crs(TARGET_CRS)
+
+    # Shapefile에서 미등록 암상 코드의 색상·이름·시대순서 자동 보충
+    auto_populate_litho_info(data['litho'], LITHO_COLORS, LITHO_NAMES)
+    auto_populate_age_order(data['litho'], LITHO_AGE_ORDER)
 
     # Load LLM results
     with open(OUTPUT_DIR / "llm_geologist_results.json", 'r', encoding='utf-8') as f:
@@ -105,8 +119,134 @@ def load_data():
     return data
 
 
+def _load_kb_module():
+    """Find and return the active geological knowledge base module from sys.modules"""
+    for name, mod in sys.modules.items():
+        if 'geological_knowledge' in name and hasattr(mod, 'ROCK_UNITS'):
+            return mod
+    return None
+
+
+def _parse_dip_range(dip_range_str):
+    """Parse expected_dip_range string to a numeric dip angle"""
+    import re
+    if not dip_range_str:
+        return None
+    s = str(dip_range_str)
+    # "20-25°NE" or "20-40°" → average
+    m = re.search(r'(\d+)\s*[-~]\s*(\d+)', s)
+    if m:
+        return (int(m.group(1)) + int(m.group(2))) / 2
+    # "관입암체" or "급경사" → steep contact
+    if '관입' in s or '급경사' in s:
+        return 75
+    # "맥상" → dyke-like steep
+    if '맥상' in s or '맥' in s:
+        return 80
+    # "수평" → nearly flat
+    if '수평' in s:
+        return 5
+    # "변화무쌍" → variable, moderate
+    if '변화' in s or '무쌍' in s:
+        return 40
+    # "다양" → various, moderate
+    if '다양' in s:
+        return 55
+    # Single number like "0-5°"
+    m = re.search(r'(\d+)', s)
+    if m:
+        return int(m.group(1))
+    return None
+
+
+def _classify_pair_from_kb(litho1, litho2):
+    """
+    Classify contact type and estimate dip angle from Knowledge Base.
+    Returns (contact_type, dip_angle) or (None, None) if KB not available.
+    """
+    kb_mod = _load_kb_module()
+    if not kb_mod:
+        return None, None
+
+    rock_units = getattr(kb_mod, 'ROCK_UNITS', {})
+    idx_to_kb = getattr(kb_mod, 'LITHOIDX_TO_KB', {})
+    contact_rules = getattr(kb_mod, 'CONTACT_RULES', {})
+
+    # Map shapefile LITHOIDX to KB code (direct match first, then via mapping)
+    def to_kb_code(litho):
+        if litho in rock_units:
+            return litho
+        return idx_to_kb.get(litho)
+
+    kb1 = to_kb_code(litho1)
+    kb2 = to_kb_code(litho2)
+
+    # 1) Try CONTACT_RULES for pair-specific classification
+    if kb1 and kb2 and contact_rules:
+        for rule_type in ['unconformable_pairs', 'intrusive_pairs', 'conformable_pairs']:
+            pairs_list = contact_rules.get(rule_type, [])
+            for p in pairs_list:
+                if (p[0] == kb1 and p[1] == kb2) or (p[0] == kb2 and p[1] == kb1):
+                    contact_type = rule_type.replace('_pairs', '')
+                    # Get pair-specific dip from KB helper
+                    get_dip_fn = getattr(kb_mod, 'get_expected_dip_range', None)
+                    dip_str = get_dip_fn(kb1, kb2) if get_dip_fn else None
+                    dip_angle = _parse_dip_range(dip_str)
+                    return contact_type, dip_angle
+
+    # 2) Fallback: individual rock's expected_contact_type
+    # unconformable > intrusive > conformable
+    contact_type = None
+    dip_angle = None
+
+    for litho_code in [kb1, kb2]:
+        if litho_code and litho_code in rock_units:
+            unit = rock_units[litho_code]
+            ct = unit.get('expected_contact_type')
+            if ct == 'unconformable':
+                contact_type = 'unconformable'
+                dip_angle = _parse_dip_range(unit.get('expected_dip_range'))
+                break
+
+    if contact_type is None:
+        for litho_code in [kb1, kb2]:
+            if litho_code and litho_code in rock_units:
+                unit = rock_units[litho_code]
+                ct = unit.get('expected_contact_type')
+                if ct == 'intrusive':
+                    contact_type = 'intrusive'
+                    dip_angle = _parse_dip_range(unit.get('expected_dip_range'))
+                    break
+
+    if contact_type is None:
+        for litho_code in [kb1, kb2]:
+            if litho_code and litho_code in rock_units:
+                unit = rock_units[litho_code]
+                ct = unit.get('expected_contact_type')
+                if ct == 'conformable':
+                    contact_type = 'conformable'
+                    # For conformable, average both units' dip ranges if available
+                    dips = []
+                    for kc in [kb1, kb2]:
+                        if kc and kc in rock_units:
+                            d = _parse_dip_range(rock_units[kc].get('expected_dip_range'))
+                            if d is not None:
+                                dips.append(d)
+                    dip_angle = sum(dips) / len(dips) if dips else None
+                    break
+
+    return contact_type, dip_angle
+
+
 def get_dip_for_litho_pair(litho1, litho2, llm_results):
-    """Get dip estimate for a lithology pair from LLM results"""
+    """Get dip estimate for a lithology pair from LLM results and Knowledge Base.
+
+    Priority chain:
+      1. LLM analysis results (exact boundary match)
+      2. Knowledge Base ROCK_UNITS (dynamic, via LITHOIDX_TO_KB mapping)
+      3. Hardcoded base (accumulated across regions, expandable)
+      4. Generic fallback
+    """
 
     def extract_full_info(boundary):
         """Extract all geometry info from boundary"""
@@ -128,40 +268,48 @@ def get_dip_for_litho_pair(litho1, litho2, llm_results):
             'fold_axis': fold_influence.get('axis_trend'),
         }
 
-    # Priority 1: Both lithologies match exactly
+    # Priority 2: Knowledge Base classification (dynamic) - 먼저 계산하여 교차검증용으로 사용
+    expected_type, kb_dip = _classify_pair_from_kb(litho1, litho2)
+
+    # Priority 1: Both lithologies match exactly in LLM results
+    # 단, KB 분류와 교차검증: LLM이 3종 이상 암상을 묶어 잘못 분류하는 것 방지
     for boundary in llm_results['boundaries']:
         lithos = boundary.get('adjacent_lithologies', [])
         if litho1 in lithos and litho2 in lithos:
-            return extract_full_info(boundary)
+            llm_type = boundary.get('contact_type', 'unknown')
+            # KB가 분류한 접촉유형과 LLM이 일치하면 LLM 결과 사용
+            if expected_type is None or llm_type == expected_type:
+                return extract_full_info(boundary)
+            # 불일치 시 LLM 결과 무시하고 KB 기반으로 폴스루
+            break
 
-    # Priority 2: Match by contact type based on rock characteristics
-    intrusive_rocks = {'Pgr', 'Jbgr', 'Kqp', 'Kqv', 'Kfl'}
-    quaternary = {'Qa'}
-    metamorphic = {'PCEbngn', 'PCEggn', 'PCEls', 'PCEqz', 'PCEam'}
+    # Priority 3: Hardcoded base (accumulated across regions)
+    if expected_type is None:
+        # Seoul region rocks
+        intrusive_rocks = {'Pgr', 'Jbgr', 'Kqp', 'Kqv', 'Kfl'}
+        quaternary = {'Qa', 'Qal'}
+        metamorphic = {'PCEbngn', 'PCEggn', 'PCEls', 'PCEqz', 'PCEam'}
+        # Busan region rocks (accumulated from previous analyses)
+        intrusive_rocks |= {'Kbgr', 'Khgdi', 'Kga', 'Kgp', 'Kad', 'Krh', 'Krt', 'Krb', 'Krwt'}
+        conformable_volcanic = {'Kan', 'Kanb', 'Kts', 'Kdban', 'Kdlw', 'Kdtb', 'Kdup'}
 
-    if litho1 in quaternary or litho2 in quaternary:
-        expected_type = 'unconformable'
-    elif (litho1 in intrusive_rocks or litho2 in intrusive_rocks):
-        expected_type = 'intrusive'
-    elif litho1 in metamorphic and litho2 in metamorphic:
-        expected_type = 'conformable'
-    else:
-        expected_type = None
+        if litho1 in quaternary or litho2 in quaternary:
+            expected_type = 'unconformable'
+        elif litho1 in intrusive_rocks or litho2 in intrusive_rocks:
+            expected_type = 'intrusive'
+        elif litho1 in metamorphic and litho2 in metamorphic:
+            expected_type = 'conformable'
+        elif litho1 in conformable_volcanic or litho2 in conformable_volcanic:
+            expected_type = 'conformable'
 
-    # Find boundary with matching contact type
-    if expected_type:
-        for boundary in llm_results['boundaries']:
-            if boundary.get('contact_type') == expected_type:
-                lithos = boundary.get('adjacent_lithologies', [])
-                if litho1 in lithos or litho2 in lithos:
-                    info = extract_full_info(boundary)
-                    info['confidence'] = 'low'
-                    return info
+    # KB/하드코딩 분류 결과를 직접 사용 (LLM 부분매칭 제거)
+    # LLM은 소수 경계만 분석하므로 부분매칭 시 부정확한 75° 경사를
+    # KB의 정밀한 경사각(20-25° 등)에 덮어쓰는 문제가 있었음
 
-    # Priority 3: Use typical values based on contact type
+    # Priority 4: Use typical values based on contact type
     default_info = {
         'confidence': 'low',
-        'reasoning': '전형값 사용',
+        'reasoning': '지식베이스 기반 분류' if kb_dip else '전형값 사용',
         'contact_geometry': 'planar',
         'depth_behavior': 'constant',
         'depth_to_flatten': None,
@@ -172,12 +320,15 @@ def get_dip_for_litho_pair(litho1, litho2, llm_results):
     }
 
     if expected_type == 'unconformable':
-        return {**default_info, 'dip_angle': 8, 'dip_direction': 180, 'contact_type': 'unconformable'}
+        angle = kb_dip or 8
+        return {**default_info, 'dip_angle': angle, 'dip_direction': 180, 'contact_type': 'unconformable'}
     elif expected_type == 'intrusive':
-        return {**default_info, 'dip_angle': 75, 'dip_direction': 135, 'contact_type': 'intrusive',
+        angle = kb_dip or 75
+        return {**default_info, 'dip_angle': angle, 'dip_direction': 135, 'contact_type': 'intrusive',
                 'contact_geometry': 'curved', 'depth_behavior': 'flattening', 'intrusion_shape': 'stock'}
     elif expected_type == 'conformable':
-        return {**default_info, 'dip_angle': 50, 'dip_direction': 135, 'contact_type': 'conformable'}
+        angle = kb_dip or 30
+        return {**default_info, 'dip_angle': angle, 'dip_direction': 135, 'contact_type': 'conformable'}
 
     return {**default_info, 'dip_angle': 55, 'dip_direction': 135, 'contact_type': 'unknown',
             'confidence': 'very_low'}
@@ -203,9 +354,18 @@ def extract_profile(section, sample_interval=50):
         transform = dem.transform
         nodata = dem.nodata
 
+        # DEM CRS와 TARGET_CRS가 다르면 좌표 변환 준비
+        dem_crs = CRS(dem.crs) if dem.crs else None
+        target_crs = CRS(TARGET_CRS)
+        need_transform = dem_crs is not None and dem_crs != target_crs
+        if need_transform:
+            coord_transformer = Transformer.from_crs(target_crs, dem_crs, always_xy=True)
+
         for x, y in zip(xs, ys):
             try:
-                row, col = rowcol(transform, x, y)
+                # TARGET_CRS → DEM CRS 변환 (필요 시)
+                dx, dy = coord_transformer.transform(x, y) if need_transform else (x, y)
+                row, col = rowcol(transform, dx, dy)
                 if 0 <= row < dem.height and 0 <= col < dem.width:
                     elev = dem_data[row, col]
                     if nodata and elev == nodata:
@@ -352,8 +512,9 @@ def generate_intrusion_boundary(start_d, start_e, min_elev, base_dip, is_left_bo
     total_depth = start_e - min_elev
     num_points = 60
 
-    # 관입체 표면 접촉각: 35° (수직과장 2-3x 고려, 시각적으로 55-65° 보임)
-    surface_dip = 35
+    # 관입체 표면 접촉각: base_dip 기반 (KB에서 전달된 경사각 사용)
+    # 범위 제한: 25-50° (너무 완만하거나 수직벽이 되지 않도록)
+    surface_dip = max(25, min(50, abs(base_dip))) if base_dip else 35
 
     depths = np.linspace(0, total_depth, num_points)
     x_coords = [start_d]
@@ -363,21 +524,26 @@ def generate_intrusion_boundary(start_d, start_e, min_elev, base_dip, is_left_bo
     effective_width = unit_width or 1000
     max_expansion = effective_width * 1.5
 
+    # 경사 변화 마일스톤 (surface_dip 기반으로 동적 계산)
+    mid_dip = surface_dip * 0.5       # 중부: 표면 경사의 50%
+    bottom_dip = max(5, surface_dip * 0.15)  # 하부: 표면의 15%, 최소 5°
+
     for i, depth in enumerate(depths[1:], 1):
         progress = depth / total_depth  # 0 to 1
 
         # 비선형 경사 변화: 심부로 갈수록 급격히 완만해짐
-        # 상부 15%: 42° → 38° (급한 상부)
-        # 중부 35%: 38° → 18° (빠르게 완만해짐)
-        # 하부 50%: 18° → 5° (거의 수평 플레어)
-        if progress < 0.15:
-            local_dip = surface_dip - progress * 27  # 42° → 38°
+        # 상부 20%: surface_dip에서 약간 감소
+        # 중부 30%: mid_dip까지 점진 감소
+        # 하부 50%: bottom_dip까지 (거의 수평 플레어)
+        if progress < 0.2:
+            local_dip = surface_dip - progress * (surface_dip - mid_dip) / 0.2 * 0.3
         elif progress < 0.5:
-            mid_progress = (progress - 0.15) / 0.35  # 0 to 1
-            local_dip = 38 - mid_progress * 20  # 38° → 18°
+            upper_end = surface_dip * 0.85
+            mid_progress = (progress - 0.2) / 0.3
+            local_dip = upper_end - mid_progress * (upper_end - mid_dip)
         else:
-            bottom_progress = (progress - 0.5) / 0.5  # 0 to 1
-            local_dip = 18 - bottom_progress * 13  # 18° → 5°
+            bottom_progress = (progress - 0.5) / 0.5
+            local_dip = mid_dip - bottom_progress * (mid_dip - bottom_dip)
 
         # 경사에 따른 수평 이동
         delta_depth = depths[i] - depths[i-1]
@@ -410,7 +576,7 @@ def generate_metamorphic_boundary(start_d, start_e, min_elev, app_dip, length):
     Generate metamorphic rock boundary (conformable, follows foliation).
 
     변성암은 (수직과장 고려):
-    - 서울 지역 엽리 방향 SE 40-50° (수직과장으로 더 가파르게 보임)
+    - 엽리 방향 SE 40-50° (수직과장으로 더 가파르게 보임)
     - 실제 경사 30-40°로 설정 (시각적으로 45-55° 보임)
     - 습곡 영향으로 완만한 굴곡
     """
@@ -544,8 +710,14 @@ def create_section_figure(section, profile_data, projections, output_name):
                                     gridspec_kw={'height_ratios': [6, 1]})
 
     # 깊이를 1km로 설정 (관입체 형태를 보여주기 위해)
-    min_elev = np.nanmin(elevations) - 1000
-    max_elev = np.nanmax(elevations) + 50
+    valid_elevations = elevations[np.isfinite(elevations)] if hasattr(elevations, '__len__') else elevations
+    if len(valid_elevations) == 0:
+        # 유효한 고도 데이터가 없으면 기본값 사용
+        min_elev = -1000
+        max_elev = 100
+    else:
+        min_elev = np.nanmin(valid_elevations) - 1000
+        max_elev = np.nanmax(valid_elevations) + 50
     depth = 1050
 
     # 수직 과장 계산 (X/Y 스케일 비율)
@@ -561,12 +733,13 @@ def create_section_figure(section, profile_data, projections, output_name):
                                          p['start_dist']))
 
     # ========== 배경 채우기: 빈 공간이 없도록 ==========
-    # 전체 단면을 가장 오래된 암석(PCEbngn)으로 먼저 채움
+    # 전체 단면을 가장 오래된 암석으로 먼저 채움
     # 회색 "미분화 기반암"은 검토자가 비과학적이라고 비판하므로
-    # 기저 변성암으로 채워서 빈 공간이 발생하지 않도록 함
-    base_rock_color = LITHO_COLORS.get('PCEbngn', '#FFB6C1')
+    # 기저 암석으로 채워서 빈 공간이 발생하지 않도록 함
+    oldest_code = min(LITHO_AGE_ORDER.keys(), key=lambda k: LITHO_AGE_ORDER[k]) if LITHO_AGE_ORDER else None
+    base_rock_color = LITHO_COLORS.get(oldest_code, '#FFB6C1') if oldest_code else '#FFB6C1'
     ax1.fill([0, length, length, 0], [max_elev, max_elev, min_elev, min_elev],
-             color=base_rock_color, alpha=0.6, zorder=-1)
+             color=base_rock_color, alpha=0.35, zorder=-1)
 
     # ========== 1차 패스: Qa 이외의 암석 먼저 그리기 ==========
     plotted = set()
@@ -621,8 +794,20 @@ def create_section_figure(section, profile_data, projections, output_name):
         poly_x = [p[0] for p in left_curve] + [p[0] for p in reversed(right_curve)]
         poly_y = [p[1] for p in left_curve] + [p[1] for p in reversed(right_curve)]
 
+        # 암체 폴리곤 그리기 - 검정 테두리로 각 암체를 명확히 구분
         ax1.fill(poly_x, poly_y, color=color, alpha=alpha,
-                edgecolor='none', linewidth=0, label=label, zorder=poly_zorder)
+                edgecolor='black', linewidth=0.8, label=label, zorder=poly_zorder)
+
+        # 암체 내부에 암상 코드 라벨 추가 (폭이 충분한 경우)
+        body_width = end_d - start_d
+        if body_width > length * 0.02:
+            label_x = (start_d + end_d) / 2
+            label_y = (start_e + end_e) / 2 - depth * 0.15
+            ax1.text(label_x, label_y, litho_code,
+                    ha='center', va='center', fontsize=14, fontweight='bold',
+                    color='white', zorder=poly_zorder + 50,
+                    bbox=dict(facecolor=color, edgecolor='black', alpha=0.8,
+                             boxstyle='round,pad=0.3'))
 
         # 경계선 그리기 - 상부 500m만 표시 (너무 깊게 표시하면 혼란 유발)
         contact_color = CONTACT_COLORS.get(proj['contact_type'], 'gray')
@@ -930,30 +1115,48 @@ def create_summary_plots(data):
 
                 if geom.geom_type == 'LineString':
                     ax.plot(*geom.xy, color=color, linewidth=3, alpha=0.8)
-                    # Add label at centroid
                     centroid = geom.centroid
-                    ax.annotate(f"{i+1}", (centroid.x, centroid.y),
-                               fontsize=8, fontweight='bold', color='white',
-                               bbox=dict(boxstyle='circle', facecolor=color, edgecolor='black', alpha=0.9),
-                               ha='center', va='center')
                 elif geom.geom_type == 'MultiLineString':
                     for line in geom.geoms:
                         ax.plot(*line.xy, color=color, linewidth=3, alpha=0.8)
-                    # Label on first segment
                     centroid = geom.geoms[0].centroid
-                    ax.annotate(f"{i+1}", (centroid.x, centroid.y),
-                               fontsize=8, fontweight='bold', color='white',
-                               bbox=dict(boxstyle='circle', facecolor=color, edgecolor='black', alpha=0.9),
-                               ha='center', va='center')
+                else:
+                    continue
 
-    # Plot sections
+                # Add number label
+                ax.annotate(f"{i+1}", (centroid.x, centroid.y),
+                           fontsize=8, fontweight='bold', color='white',
+                           bbox=dict(boxstyle='circle', facecolor=color, edgecolor='black', alpha=0.9),
+                           ha='center', va='center')
+                # Add litho labels at boundary
+                if litho_str:
+                    ax.annotate(litho_str, (centroid.x, centroid.y),
+                               fontsize=7, ha='center', va='top',
+                               xytext=(0, -15), textcoords='offset points',
+                               color='black', fontweight='bold',
+                               bbox=dict(facecolor='white', alpha=0.85, edgecolor='gray',
+                                        boxstyle='round,pad=0.2'))
+
+    # Plot sections - 두꺼운 흰색 배경선 + 검정 전경선으로 가시성 확보
     for section in data['sections']:
-        ax.plot([section['start']['x'], section['end']['x']],
-               [section['start']['y'], section['end']['y']],
-               'k-', linewidth=2, alpha=0.7)
-        mid_x = (section['start']['x'] + section['end']['x']) / 2
-        mid_y = (section['start']['y'] + section['end']['y']) / 2
-        ax.annotate(section['name'], (mid_x, mid_y), fontsize=9, fontweight='bold')
+        sx, sy = section['start']['x'], section['start']['y']
+        ex, ey = section['end']['x'], section['end']['y']
+        # 흰색 배경선 (두꺼운)
+        ax.plot([sx, ex], [sy, ey], color='white', linewidth=5, alpha=0.9, zorder=10)
+        # 검정 전경선
+        ax.plot([sx, ex], [sy, ey], color='black', linewidth=2.5, alpha=0.9, zorder=11)
+        # 시종점 마커
+        ax.plot(sx, sy, 'o', color='white', markersize=8, markeredgecolor='black',
+                markeredgewidth=2, zorder=12)
+        ax.plot(ex, ey, 's', color='white', markersize=8, markeredgecolor='black',
+                markeredgewidth=2, zorder=12)
+        # 단면 이름 라벨
+        mid_x = (sx + ex) / 2
+        mid_y = (sy + ey) / 2
+        ax.annotate(section['name'], (mid_x, mid_y), fontsize=10, fontweight='bold',
+                   color='black', zorder=13,
+                   bbox=dict(facecolor='yellow', alpha=0.9, edgecolor='black',
+                            boxstyle='round,pad=0.3'))
 
     ax.set_aspect('equal')
     ax.set_xlabel('X (m)', fontsize=11)
@@ -961,11 +1164,26 @@ def create_summary_plots(data):
     ax.set_title('AI 분석 경계 위치 (Analyzed Boundary Locations)', fontsize=12)
     ax.grid(True, alpha=0.3)
 
-    # Legend
-    for ct, color in CONTACT_COLORS.items():
+    # Contact type legend (upper left)
+    contact_handles = []
+    for ct, ct_color in CONTACT_COLORS.items():
         if ct != 'fault':
-            ax.plot([], [], color=color, linewidth=3, label=ct)
-    ax.legend(loc='upper left')
+            contact_handles.append(mpatches.Patch(facecolor=ct_color, alpha=0.8, label=ct))
+    contact_legend = ax.legend(handles=contact_handles, loc='upper left', fontsize=8,
+                               title='접촉 유형 (Contact Type)', title_fontsize=9)
+    ax.add_artist(contact_legend)
+
+    # Litho legend (lower right) - all unique rock types with colors
+    unique_lithos = sorted(data['litho']['LITHOIDX'].dropna().unique())
+    litho_patches = []
+    for code in unique_lithos:
+        lc = LITHO_COLORS.get(code, '#CCCCCC')
+        ln = LITHO_NAMES.get(code, code)
+        litho_patches.append(mpatches.Patch(facecolor=lc, edgecolor='gray',
+                                            alpha=0.7, label=f"{code} ({ln})"))
+    ncol = max(1, (len(litho_patches) + 5) // 6)
+    ax.legend(handles=litho_patches, loc='lower right', fontsize=7, ncol=ncol,
+              title='암상 (Lithology)', title_fontsize=9)
 
     # Save map as separate file
     fig.savefig(OUTPUT_DIR / 'boundary_location_map.png', dpi=150, bbox_inches='tight', facecolor='white')
@@ -973,6 +1191,71 @@ def create_summary_plots(data):
     plots['map_view'] = fig_to_base64(fig)
 
     return plots
+
+
+def _generate_geological_overview_html():
+    """지식베이스의 지역 지질 개요를 HTML로 변환"""
+    import sys
+    import html as html_mod
+
+    # geologist_agent_llm에서 GEOLOGICAL_CONTEXT 가져오기
+    geo_mod = sys.modules.get('geologist_agent_llm')
+    context = getattr(geo_mod, 'GEOLOGICAL_CONTEXT', '') if geo_mod else ''
+
+    if not context or context.strip().startswith('# 지질 개요'):
+        # 기본 컨텍스트(짧은 것)만 있으면 생략
+        return '<p style="color: #999;">지역 지식베이스가 로드되지 않았습니다.</p>'
+
+    # Markdown → 간단 HTML 변환
+    lines = context.strip().split('\n')
+    html_parts = []
+    for line in lines:
+        line = line.strip()
+        if not line:
+            continue
+        if line.startswith('# '):
+            html_parts.append(f'<h3>{html_mod.escape(line[2:])}</h3>')
+        elif line.startswith('## '):
+            html_parts.append(f'<h4 style="margin-top:15px; color:#2c3e50;">{html_mod.escape(line[3:])}</h4>')
+        elif line.startswith('### '):
+            html_parts.append(f'<h5 style="color:#34495e;">{html_mod.escape(line[4:])}</h5>')
+        elif line.startswith('- **'):
+            # Bold list item: - **KEY** text
+            parts = line[2:].split('**')
+            if len(parts) >= 3:
+                bold = html_mod.escape(parts[1])
+                rest = html_mod.escape('**'.join(parts[2:]))
+                html_parts.append(f'<li><strong>{bold}</strong>{rest}</li>')
+            else:
+                html_parts.append(f'<li>{html_mod.escape(line[2:])}</li>')
+        elif line.startswith('- '):
+            html_parts.append(f'<li>{html_mod.escape(line[2:])}</li>')
+        else:
+            html_parts.append(f'<p>{html_mod.escape(line)}</p>')
+
+    return '\n'.join(html_parts)
+
+
+def _generate_litho_legend_html(data):
+    """현재 데이터의 LITHOIDX 코드에 해당하는 범례 HTML 동적 생성"""
+    import html as html_mod
+    legend_items = []
+    # 현재 데이터에 실제 존재하는 암상 코드만 표시
+    if 'litho' in data and 'LITHOIDX' in data['litho'].columns:
+        unique_codes = data['litho']['LITHOIDX'].dropna().unique()
+    else:
+        unique_codes = list(LITHO_NAMES.keys())
+
+    for code in sorted(unique_codes, key=lambda c: LITHO_AGE_ORDER.get(c, 99)):
+        color = LITHO_COLORS.get(code, '#CCCCCC')
+        name = html_mod.escape(LITHO_NAMES.get(code, code))
+        legend_items.append(
+            f'<div style="display: flex; align-items: center; padding: 8px; background: #f8f9fa; border-radius: 5px;">'
+            f'<span style="display: inline-block; width: 30px; height: 20px; background: {color}; border: 1px solid #999; margin-right: 10px;"></span>'
+            f'<strong>{html_mod.escape(code)}</strong>&nbsp;- {name}'
+            f'</div>'
+        )
+    return '\n                '.join(legend_items)
 
 
 def generate_html_report(data, section_images, plots):
@@ -991,7 +1274,7 @@ def generate_html_report(data, section_images, plots):
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>AI Geologist Agent Report - 서울 지질 분석</title>
+    <title>AI Geologist Agent Report - {REGION_NAME_KR} 지질 분석</title>
     <style>
         :root {{
             --primary: #2c3e50;
@@ -1278,7 +1561,7 @@ def generate_html_report(data, section_images, plots):
     <div class="container">
         <header>
             <h1>🌍 AI Geologist Agent Report</h1>
-            <p>서울 지역 지질 경계 지하구조 추정 보고서</p>
+            <p>{REGION_NAME_KR} 지역 지질 경계 지하구조 추정 보고서</p>
             <p style="font-size: 0.9em; margin-top: 10px;">Generated: {datetime.now().strftime('%Y-%m-%d %H:%M')}</p>
         </header>
 
@@ -1299,6 +1582,11 @@ def generate_html_report(data, section_images, plots):
                 <h3>{contact_types.count('intrusive')}</h3>
                 <p>관입 접촉<br>Intrusive Contacts</p>
             </div>
+        </div>
+
+        <div class="section">
+            <h2>🏔️ {REGION_NAME_KR} 지역 지질 개요 (Regional Geological Context)</h2>
+            {_generate_geological_overview_html()}
         </div>
 
         <div class="section">
@@ -1324,51 +1612,8 @@ def generate_html_report(data, section_images, plots):
         <div class="section">
             <h2>🪨 암석 단위 범례 (Lithology Legend)</h2>
             <p style="margin-bottom: 15px; color: #666;">단면도에 표시된 암석 코드와 한글 이름입니다.</p>
-            <div style="display: grid; grid-template-columns: repeat(auto-fit, minmax(250px, 1fr)); gap: 10px;">
-                <div style="display: flex; align-items: center; padding: 8px; background: #f8f9fa; border-radius: 5px;">
-                    <span style="display: inline-block; width: 30px; height: 20px; background: #FFB6C1; border: 1px solid #999; margin-right: 10px;"></span>
-                    <strong>PCEbngn</strong>&nbsp;- 호상흑운모편마암
-                </div>
-                <div style="display: flex; align-items: center; padding: 8px; background: #f8f9fa; border-radius: 5px;">
-                    <span style="display: inline-block; width: 30px; height: 20px; background: #DDA0DD; border: 1px solid #999; margin-right: 10px;"></span>
-                    <strong>PCEggn</strong>&nbsp;- 화강편마암
-                </div>
-                <div style="display: flex; align-items: center; padding: 8px; background: #f8f9fa; border-radius: 5px;">
-                    <span style="display: inline-block; width: 30px; height: 20px; background: #87CEEB; border: 1px solid #999; margin-right: 10px;"></span>
-                    <strong>PCEls</strong>&nbsp;- 결정질석회암
-                </div>
-                <div style="display: flex; align-items: center; padding: 8px; background: #f8f9fa; border-radius: 5px;">
-                    <span style="display: inline-block; width: 30px; height: 20px; background: #F0E68C; border: 1px solid #999; margin-right: 10px;"></span>
-                    <strong>PCEqz</strong>&nbsp;- 규암
-                </div>
-                <div style="display: flex; align-items: center; padding: 8px; background: #f8f9fa; border-radius: 5px;">
-                    <span style="display: inline-block; width: 30px; height: 20px; background: #90EE90; border: 1px solid #999; margin-right: 10px;"></span>
-                    <strong>PCEam</strong>&nbsp;- 각섬암
-                </div>
-                <div style="display: flex; align-items: center; padding: 8px; background: #f8f9fa; border-radius: 5px;">
-                    <span style="display: inline-block; width: 30px; height: 20px; background: #FFA07A; border: 1px solid #999; margin-right: 10px;"></span>
-                    <strong>Pgr</strong>&nbsp;- 반상화강암
-                </div>
-                <div style="display: flex; align-items: center; padding: 8px; background: #f8f9fa; border-radius: 5px;">
-                    <span style="display: inline-block; width: 30px; height: 20px; background: #FF6347; border: 1px solid #999; margin-right: 10px;"></span>
-                    <strong>Jbgr</strong>&nbsp;- 흑운모화강암
-                </div>
-                <div style="display: flex; align-items: center; padding: 8px; background: #f8f9fa; border-radius: 5px;">
-                    <span style="display: inline-block; width: 30px; height: 20px; background: #DEB887; border: 1px solid #999; margin-right: 10px;"></span>
-                    <strong>Kqp</strong>&nbsp;- 석영반암
-                </div>
-                <div style="display: flex; align-items: center; padding: 8px; background: #f8f9fa; border-radius: 5px;">
-                    <span style="display: inline-block; width: 30px; height: 20px; background: #D2691E; border: 1px solid #999; margin-right: 10px;"></span>
-                    <strong>Kqv</strong>&nbsp;- 석영맥
-                </div>
-                <div style="display: flex; align-items: center; padding: 8px; background: #f8f9fa; border-radius: 5px;">
-                    <span style="display: inline-block; width: 30px; height: 20px; background: #BC8F8F; border: 1px solid #999; margin-right: 10px;"></span>
-                    <strong>Kfl</strong>&nbsp;- 규장암
-                </div>
-                <div style="display: flex; align-items: center; padding: 8px; background: #f8f9fa; border-radius: 5px;">
-                    <span style="display: inline-block; width: 30px; height: 20px; background: #FFFACD; border: 1px solid #999; margin-right: 10px;"></span>
-                    <strong>Qa</strong>&nbsp;- 충적층
-                </div>
+            <div style="display: grid; grid-template-columns: repeat(auto-fit, minmax(300px, 1fr)); gap: 10px;">
+                {_generate_litho_legend_html(data)}
             </div>
         </div>
 
@@ -1488,7 +1733,7 @@ def generate_html_report(data, section_images, plots):
             </p>
 """
 
-    html += """
+    html += f"""
         </div>
 
         <div class="section">
@@ -1526,7 +1771,7 @@ def generate_html_report(data, section_images, plots):
 
         <footer>
             <p>Generated by AI Geologist Agent | Claude API (claude-sonnet-4-20250514)</p>
-            <p>서울 지역 1:50,000 수치지질도 기반</p>
+            <p>{REGION_NAME_KR} 지역 1:50,000 수치지질도 기반</p>
         </footer>
     </div>
 </body>
@@ -1544,6 +1789,12 @@ def main():
 
     # Load data
     data = load_data()
+
+    # 이전 실행의 단면도 PNG 삭제 (필터링된 단면이 남아있는 것 방지)
+    import glob as glob_mod
+    for old_png in glob_mod.glob(str(OUTPUT_DIR / '*_llm_section.png')):
+        os.remove(old_png)
+        print(f"  Cleaned up: {Path(old_png).name}")
 
     # Process sections
     print("\nProcessing cross-sections...")

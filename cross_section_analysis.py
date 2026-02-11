@@ -35,6 +35,10 @@ OUTPUT_DIR = PATHS['output_dir']
 # Target CRS for metric calculations (Korea 2000 / Central Belt)
 TARGET_CRS = CONFIG['crs']
 
+# 지역명 (reconfigure()로 업데이트됨)
+REGION_NAME_KR = "서울"
+REGION_NAME_EN = "Seoul"
+
 # Korean font setting
 viz_params = CONFIG['visualization']
 plt.rcParams['font.family'] = viz_params.get('font_family', 'Malgun Gothic')
@@ -57,9 +61,18 @@ def load_shapefiles():
     data['foliation'] = gpd.read_file(shp_paths['foliation']).to_crs(TARGET_CRS)
     print(f"  - Foliation data: {len(data['foliation'])}")
 
-    # Lithology
-    data['litho'] = gpd.read_file(shp_paths['litho']).to_crs(TARGET_CRS)
+    # Lithology (인코딩 자동감지로 LITHONAME 한글 정상 읽기)
+    from config_loader import read_shapefile_safe, auto_populate_litho_info
+    data['litho'] = read_shapefile_safe(shp_paths['litho'], target_crs=TARGET_CRS)
     print(f"  - Lithology units: {len(data['litho'])}")
+
+    # Shapefile에서 미등록 암상 코드의 색상·이름 자동 보충
+    auto_populate_litho_info(data['litho'], CONFIG['litho_colors'], CONFIG['litho_names_kr'])
+    # 영문 이름도 미등록 코드에 대해 LITHOIDX 코드로 보충
+    for _, _row in data['litho'].drop_duplicates(subset=['LITHOIDX']).iterrows():
+        _idx = str(_row.get('LITHOIDX', '')).strip()
+        if _idx and _idx not in CONFIG.get('litho_names_en', {}):
+            CONFIG.setdefault('litho_names_en', {})[_idx] = _idx
 
     # Geological boundaries
     data['boundary'] = gpd.read_file(shp_paths['boundary']).to_crs(TARGET_CRS)
@@ -238,7 +251,13 @@ def estimate_strike_from_boundaries(boundary_gdf):
     return azimuths
 
 def generate_auto_crosssection(data, optimal_azimuth, num_sections=3):
-    """Generate automatic cross-sections based on geological structure"""
+    """Generate automatic cross-sections based on geological structure.
+    단면선을 litho shapefile의 실제 커버리지 영역 내에서 클리핑하여
+    해안 지역 등에서 지질도 밖으로 벗어나지 않도록 함.
+    """
+    from shapely.geometry import LineString
+    from shapely.ops import unary_union
+
     print("\n" + "=" * 60)
     print("4. Auto Cross-Section Generation")
     print("=" * 60)
@@ -250,11 +269,16 @@ def generate_auto_crosssection(data, optimal_azimuth, num_sections=3):
     print(f"    X: {bounds[0]:.1f} ~ {bounds[2]:.1f} m")
     print(f"    Y: {bounds[1]:.1f} ~ {bounds[3]:.1f} m")
 
+    # Litho shapefile의 실제 커버리지 영역 (union + buffer)
+    # convex_hull 대신 실제 union을 사용하여 바다/빈 영역 제외
+    litho_union = unary_union(data['litho'].geometry)
+    litho_hull = litho_union.buffer(500)  # 500m 버퍼로 작은 틈 연결
+
     # Center point
     center_x = (bounds[0] + bounds[2]) / 2
     center_y = (bounds[1] + bounds[3]) / 2
 
-    # Section length = 70% of diagonal
+    # Section length = 70% of diagonal (초기 길이, 클리핑으로 줄어듦)
     width = bounds[2] - bounds[0]
     height = bounds[3] - bounds[1]
     diag_length = np.sqrt(width**2 + height**2)
@@ -276,27 +300,68 @@ def generate_auto_crosssection(data, optimal_azimuth, num_sections=3):
         offset_center_x = center_x + offset * np.sin(perpendicular_az)
         offset_center_y = center_y + offset * np.cos(perpendicular_az)
 
-        # Section start and end points
+        # Section start and end points (초기 - 클리핑 전)
         half_len = section_length / 2
         start_x = offset_center_x - half_len * np.sin(az_rad)
         start_y = offset_center_y - half_len * np.cos(az_rad)
         end_x = offset_center_x + half_len * np.sin(az_rad)
         end_y = offset_center_y + half_len * np.cos(az_rad)
 
+        # Litho 커버리지 영역으로 클리핑
+        raw_line = LineString([(start_x, start_y), (end_x, end_y)])
+        clipped = raw_line.intersection(litho_hull)
+
+        if clipped.is_empty:
+            print(f"\n  Auto Section {i + 1}: SKIPPED (no litho coverage)")
+            continue
+
+        # MultiLineString인 경우 가장 긴 세그먼트 사용
+        if clipped.geom_type == 'MultiLineString':
+            clipped = max(clipped.geoms, key=lambda g: g.length)
+
+        if clipped.geom_type != 'LineString' or clipped.length < 1000:
+            print(f"\n  Auto Section {i + 1}: SKIPPED (clipped length too short)")
+            continue
+
+        # 실제 litho 커버리지 확인 (클리핑된 선이 실제 litho와 얼마나 겹치는지)
+        litho_intersection = clipped.intersection(litho_union)
+        if litho_intersection.is_empty:
+            litho_coverage = 0
+        else:
+            litho_coverage = litho_intersection.length / clipped.length
+
+        if litho_coverage < 0.3:
+            print(f"\n  Auto Section {i + 1}: SKIPPED (litho coverage {litho_coverage:.1%} < 30%)")
+            continue
+
+        # 암상 다양성 확인: 단면이 2종 이상의 암상을 교차해야 의미 있음
+        section_litho = data['litho'][data['litho'].intersects(clipped)]
+        litho_codes_on_line = set(section_litho['LITHOIDX'].dropna().unique()) if 'LITHOIDX' in section_litho.columns else set()
+        if len(litho_codes_on_line) < 2:
+            print(f"\n  Auto Section {i + 1}: SKIPPED (only {len(litho_codes_on_line)} rock type(s), need ≥2)")
+            continue
+
+        clip_coords = list(clipped.coords)
+        clipped_start = clip_coords[0]
+        clipped_end = clip_coords[-1]
+        clipped_length = clipped.length
+
         section = {
             'name': f'Auto_{chr(65+i)}-{chr(65+i)}\'',  # A-A', B-B', C-C'
-            'start': (start_x, start_y),
-            'end': (end_x, end_y),
+            'start': (clipped_start[0], clipped_start[1]),
+            'end': (clipped_end[0], clipped_end[1]),
             'azimuth': optimal_azimuth,
-            'length': section_length
+            'length': clipped_length
         }
         auto_sections.append(section)
 
         print(f"\n  Auto Section {i + 1} ({section['name']}):")
-        print(f"    Start: ({start_x:.1f}, {start_y:.1f})")
-        print(f"    End: ({end_x:.1f}, {end_y:.1f})")
+        print(f"    Start: ({clipped_start[0]:.1f}, {clipped_start[1]:.1f})")
+        print(f"    End: ({clipped_end[0]:.1f}, {clipped_end[1]:.1f})")
         print(f"    Azimuth: {optimal_azimuth:.1f} deg")
-        print(f"    Length: {section_length:.1f} m")
+        print(f"    Length: {clipped_length:.1f} m (clipped from {section_length:.1f} m)")
+        print(f"    Litho coverage: {litho_coverage:.1%}")
+        print(f"    Rock types crossed: {len(litho_codes_on_line)} ({', '.join(sorted(litho_codes_on_line))})")
 
     return auto_sections
 
@@ -439,8 +504,8 @@ def visualize_comparison(data, existing, auto, comparison):
 
     ax1.set_xlabel('X (m)', fontsize=11)
     ax1.set_ylabel('Y (m)', fontsize=11)
-    ax1.set_title('Seoul Geological Map - Cross-Section Comparison\n'
-                  '서울 지질도 - 측선 비교 (Blue: Existing, Red: Auto)', fontsize=12)
+    ax1.set_title(f'{REGION_NAME_EN} Geological Map - Cross-Section Comparison\n'
+                  f'{REGION_NAME_KR} 지질도 - 측선 비교 (Blue: Existing, Red: Auto)', fontsize=12)
     ax1.legend(loc='upper left', fontsize=8, ncol=2)
     ax1.set_aspect('equal')
     ax1.grid(True, alpha=0.3)
@@ -585,8 +650,8 @@ def save_results(comparison, mean_strike, optimal_azimuth):
 def main():
     """Main execution"""
     print("\n" + "=" * 60)
-    print("  Seoul Geology Cross-Section Automation")
-    print("  서울 지질 단면 자동화 - 측선 분석")
+    print(f"  {REGION_NAME_EN} Geology Cross-Section Automation")
+    print(f"  {REGION_NAME_KR} 지질 단면 자동화 - 측선 분석")
     print("=" * 60)
 
     # 1. Load data

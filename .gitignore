@@ -9,8 +9,10 @@ ENV/
 
 # API keys and secrets
 config.yaml
+config.yaml.bak
 
-# Data files (large)
+# Data files (large binary)
+DataRepository/
 *.zip
 *.img
 *.tif
@@ -29,12 +31,22 @@ config.yaml
 
 # Output files
 output/
-*.json
 *_ocr_text.txt
+
+# JSON (analysis results, but keep package.json etc.)
+crosssection_analysis.json
+llm_geologist_results.json
+review_results.json
 
 # Temp files
 _temp_*
 *.tmp
+*.tmp.*
+nul
+
+# Logs
+server.log
+*.log
 
 # IDE
 .vscode/
@@ -44,6 +56,9 @@ _temp_*
 # OS
 .DS_Store
 Thumbs.db
+
+# Claude Code
+.claude/
 
 # Backup
 backup/

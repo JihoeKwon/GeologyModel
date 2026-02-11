@@ -1,0 +1,889 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Geology Cross-Section Agent</title>
+<style>
+:root {
+  --bg: #f5f6fa;
+  --surface: #ffffff;
+  --border: #e1e4e8;
+  --text: #1a1a2e;
+  --text-secondary: #586069;
+  --primary: #2563eb;
+  --primary-hover: #1d4ed8;
+  --success: #16a34a;
+  --warning: #d97706;
+  --danger: #dc2626;
+  --accent: #7c3aed;
+  --radius: 8px;
+  --shadow: 0 1px 3px rgba(0,0,0,0.08), 0 1px 2px rgba(0,0,0,0.06);
+  --shadow-lg: 0 4px 12px rgba(0,0,0,0.1);
+}
+
+@media (prefers-color-scheme: dark) {
+  :root {
+    --bg: #0d1117;
+    --surface: #161b22;
+    --border: #30363d;
+    --text: #e6edf3;
+    --text-secondary: #8b949e;
+    --primary: #58a6ff;
+    --primary-hover: #79b8ff;
+    --success: #3fb950;
+    --warning: #d29922;
+    --danger: #f85149;
+    --accent: #bc8cff;
+    --shadow: 0 1px 3px rgba(0,0,0,0.3);
+    --shadow-lg: 0 4px 12px rgba(0,0,0,0.4);
+  }
+}
+
+* { margin: 0; padding: 0; box-sizing: border-box; }
+
+body {
+  font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+  background: var(--bg);
+  color: var(--text);
+  line-height: 1.5;
+  min-height: 100vh;
+}
+
+.container {
+  max-width: 1100px;
+  margin: 0 auto;
+  padding: 24px 20px;
+}
+
+/* Header */
+header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 16px 24px;
+  background: var(--surface);
+  border-bottom: 1px solid var(--border);
+  position: sticky;
+  top: 0;
+  z-index: 10;
+}
+
+header h1 {
+  font-size: 18px;
+  font-weight: 600;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+header h1::before {
+  content: '';
+  display: inline-block;
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  background: var(--text-secondary);
+}
+
+header h1.connected::before { background: var(--success); }
+header h1.disconnected::before { background: var(--danger); }
+
+#server-status {
+  font-size: 13px;
+  color: var(--text-secondary);
+  font-weight: 400;
+}
+
+/* Sections */
+.card {
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  box-shadow: var(--shadow);
+  margin-bottom: 20px;
+}
+
+.card-header {
+  padding: 12px 20px;
+  border-bottom: 1px solid var(--border);
+  font-size: 14px;
+  font-weight: 600;
+  color: var(--text-secondary);
+  text-transform: uppercase;
+  letter-spacing: 0.5px;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+}
+
+.btn-close {
+  background: none;
+  border: none;
+  color: var(--text-secondary);
+  font-size: 18px;
+  cursor: pointer;
+  padding: 0 4px;
+  line-height: 1;
+}
+
+.btn-close:hover { color: var(--text); }
+
+.card-body {
+  padding: 20px;
+}
+
+/* Analysis Request Form */
+.form-row {
+  display: flex;
+  align-items: center;
+  gap: 16px;
+  flex-wrap: wrap;
+}
+
+.form-group {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.form-group label {
+  font-size: 14px;
+  font-weight: 500;
+  white-space: nowrap;
+}
+
+select {
+  padding: 8px 12px;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  background: var(--surface);
+  color: var(--text);
+  font-size: 14px;
+  cursor: pointer;
+  min-width: 140px;
+}
+
+select:focus {
+  outline: none;
+  border-color: var(--primary);
+  box-shadow: 0 0 0 2px rgba(37, 99, 235, 0.2);
+}
+
+.checkbox-group {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 13px;
+  cursor: pointer;
+  user-select: none;
+}
+
+.checkbox-group input[type="checkbox"] {
+  accent-color: var(--primary);
+  width: 16px;
+  height: 16px;
+  cursor: pointer;
+}
+
+.btn {
+  padding: 8px 20px;
+  border: none;
+  border-radius: 6px;
+  font-size: 14px;
+  font-weight: 500;
+  cursor: pointer;
+  transition: background 0.15s, opacity 0.15s;
+}
+
+.btn-primary {
+  background: var(--primary);
+  color: #fff;
+}
+
+.btn-primary:hover { background: var(--primary-hover); }
+.btn-primary:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
+
+.btn-sm {
+  padding: 6px 14px;
+  font-size: 13px;
+}
+
+.btn-outline {
+  background: transparent;
+  color: var(--primary);
+  border: 1px solid var(--primary);
+}
+
+.btn-outline:hover {
+  background: var(--primary);
+  color: #fff;
+}
+
+.spacer { flex: 1; }
+
+/* Progress Section */
+#progress-section { display: none; }
+
+.progress-bar-track {
+  width: 100%;
+  height: 8px;
+  background: var(--border);
+  border-radius: 4px;
+  overflow: hidden;
+  margin-bottom: 6px;
+}
+
+.progress-bar-fill {
+  height: 100%;
+  background: var(--primary);
+  border-radius: 4px;
+  transition: width 0.4s ease;
+  width: 0%;
+}
+
+.progress-text {
+  font-size: 13px;
+  color: var(--text-secondary);
+  margin-bottom: 16px;
+}
+
+.steps-row {
+  display: flex;
+  gap: 4px;
+  flex-wrap: wrap;
+  margin-top: 12px;
+}
+
+.step {
+  display: flex;
+  align-items: center;
+  gap: 5px;
+  padding: 4px 10px;
+  font-size: 12px;
+  border-radius: 12px;
+  background: var(--bg);
+  white-space: nowrap;
+}
+
+.step-icon {
+  font-size: 11px;
+  width: 16px;
+  text-align: center;
+}
+
+.step.completed .step-icon { color: var(--success); }
+.step.completed .step-icon::after { content: '\2713'; }
+
+.step.running .step-icon { color: var(--primary); }
+.step.running .step-icon::after { content: '\25CF'; }
+.step.running {
+  background: rgba(37, 99, 235, 0.1);
+  font-weight: 500;
+}
+
+.step.pending .step-icon { color: var(--text-secondary); }
+.step.pending .step-icon::after { content: '\25CB'; }
+
+.step.failed .step-icon { color: var(--danger); }
+.step.failed .step-icon::after { content: '\2717'; }
+
+/* Results Section */
+#results-section { display: none; }
+
+.result-summary {
+  font-size: 14px;
+  margin-bottom: 16px;
+  padding: 12px 16px;
+  background: var(--bg);
+  border-radius: 6px;
+}
+
+.image-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(200px, 1fr));
+  gap: 12px;
+  margin-bottom: 16px;
+}
+
+.image-card {
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  overflow: hidden;
+  cursor: pointer;
+  transition: box-shadow 0.15s;
+}
+
+.image-card:hover { box-shadow: var(--shadow-lg); }
+
+.image-card img {
+  width: 100%;
+  height: 160px;
+  object-fit: cover;
+  display: block;
+  background: var(--bg);
+}
+
+.image-card .image-label {
+  padding: 8px 10px;
+  font-size: 12px;
+  font-weight: 500;
+  text-align: center;
+  border-top: 1px solid var(--border);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.result-actions {
+  display: flex;
+  gap: 10px;
+  flex-wrap: wrap;
+}
+
+.error-msg {
+  padding: 12px 16px;
+  background: rgba(220,38,38,0.08);
+  border: 1px solid rgba(220,38,38,0.2);
+  border-radius: 6px;
+  color: var(--danger);
+  font-size: 14px;
+}
+
+/* Task History */
+.task-table {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 13px;
+}
+
+.task-table th,
+.task-table td {
+  padding: 10px 12px;
+  text-align: left;
+  border-bottom: 1px solid var(--border);
+}
+
+.task-table th {
+  font-weight: 600;
+  color: var(--text-secondary);
+  font-size: 12px;
+  text-transform: uppercase;
+  letter-spacing: 0.3px;
+}
+
+.task-table tr:last-child td { border-bottom: none; }
+
+.task-table tr:hover td { background: var(--bg); }
+
+.status-badge {
+  display: inline-block;
+  padding: 2px 8px;
+  border-radius: 10px;
+  font-size: 11px;
+  font-weight: 500;
+  text-transform: uppercase;
+}
+
+.status-badge.pending { background: rgba(217,119,6,0.1); color: var(--warning); }
+.status-badge.running { background: rgba(37,99,235,0.1); color: var(--primary); }
+.status-badge.completed { background: rgba(22,163,74,0.1); color: var(--success); }
+.status-badge.failed { background: rgba(220,38,38,0.1); color: var(--danger); }
+
+.task-id-cell {
+  font-family: 'SFMono-Regular', Consolas, monospace;
+  font-size: 12px;
+  color: var(--text-secondary);
+}
+
+.empty-state {
+  text-align: center;
+  padding: 32px;
+  color: var(--text-secondary);
+  font-size: 14px;
+}
+
+/* Lightbox */
+.lightbox {
+  display: none;
+  position: fixed;
+  inset: 0;
+  background: rgba(0,0,0,0.85);
+  z-index: 100;
+  justify-content: center;
+  align-items: center;
+  cursor: pointer;
+}
+
+.lightbox.active { display: flex; }
+
+.lightbox img {
+  max-width: 90vw;
+  max-height: 90vh;
+  border-radius: 4px;
+  box-shadow: 0 8px 32px rgba(0,0,0,0.4);
+}
+
+/* Responsive */
+@media (max-width: 640px) {
+  .form-row { flex-direction: column; align-items: stretch; }
+  .form-group { justify-content: space-between; }
+  .spacer { display: none; }
+  .image-grid { grid-template-columns: repeat(auto-fill, minmax(140px, 1fr)); }
+}
+</style>
+</head>
+<body>
+
+<header>
+  <h1 id="header-title" class="disconnected">
+    Geology Cross-Section Agent
+  </h1>
+  <span id="server-status">연결 확인 중...</span>
+</header>
+
+<div class="container">
+
+  <!-- Analysis Request -->
+  <div class="card">
+    <div class="card-header">분석 요청</div>
+    <div class="card-body">
+      <div class="form-row">
+        <div class="form-group">
+          <label for="region-select">지역</label>
+          <select id="region-select">
+            <option value="">불러오는 중...</option>
+          </select>
+        </div>
+        <label class="checkbox-group">
+          <input type="checkbox" id="chk-extract">
+          지식베이스 새로 추출
+        </label>
+        <label class="checkbox-group">
+          <input type="checkbox" id="chk-skip-review">
+          검토 스킵
+        </label>
+        <div class="spacer"></div>
+        <button class="btn btn-primary" id="btn-analyze" disabled>분석 시작</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- Progress -->
+  <div class="card" id="progress-section">
+    <div class="card-header">진행 상황 <button class="btn-close" onclick="document.getElementById('progress-section').style.display='none'">&times;</button></div>
+    <div class="card-body">
+      <div class="progress-bar-track">
+        <div class="progress-bar-fill" id="progress-fill"></div>
+      </div>
+      <div class="progress-text" id="progress-text">대기 중...</div>
+      <div class="steps-row" id="steps-row"></div>
+    </div>
+  </div>
+
+  <!-- Results -->
+  <div class="card" id="results-section">
+    <div class="card-header">결과 <button class="btn-close" onclick="document.getElementById('results-section').style.display='none'">&times;</button></div>
+    <div class="card-body">
+      <div id="results-content"></div>
+    </div>
+  </div>
+
+  <!-- Task History -->
+  <div class="card">
+    <div class="card-header">작업 이력</div>
+    <div class="card-body" style="padding: 0;">
+      <div id="task-history"></div>
+    </div>
+  </div>
+
+</div>
+
+<!-- Lightbox -->
+<div class="lightbox" id="lightbox">
+  <img id="lightbox-img" src="" alt="">
+</div>
+
+<script>
+(function() {
+  'use strict';
+
+  // --- Elements ---
+  const headerTitle = document.getElementById('header-title');
+  const serverStatus = document.getElementById('server-status');
+  const regionSelect = document.getElementById('region-select');
+  const chkExtract = document.getElementById('chk-extract');
+  const chkSkipReview = document.getElementById('chk-skip-review');
+  const btnAnalyze = document.getElementById('btn-analyze');
+  const progressSection = document.getElementById('progress-section');
+  const progressFill = document.getElementById('progress-fill');
+  const progressText = document.getElementById('progress-text');
+  const stepsRow = document.getElementById('steps-row');
+  const resultsSection = document.getElementById('results-section');
+  const resultsContent = document.getElementById('results-content');
+  const taskHistory = document.getElementById('task-history');
+  const lightbox = document.getElementById('lightbox');
+  const lightboxImg = document.getElementById('lightbox-img');
+
+  // --- State ---
+  let currentTaskId = null;
+  let pollTimer = null;
+
+  const STEP_NAMES = {
+    check_data: '데이터 확인',
+    extract_knowledge: '지식베이스',
+    analyze_sections: '단면 분석',
+    generate_visualization: '시각화 생성',
+    review: '품질 검토',
+    finalize: '최종화'
+  };
+  const STEP_ORDER = ['check_data', 'extract_knowledge', 'analyze_sections', 'generate_visualization', 'review', 'finalize'];
+
+  // --- API helpers ---
+  async function api(method, path, body) {
+    const opts = {
+      method,
+      headers: { 'Content-Type': 'application/json' }
+    };
+    if (body) opts.body = JSON.stringify(body);
+    const res = await fetch(path, opts);
+    if (!res.ok) {
+      const err = await res.json().catch(() => ({}));
+      throw new Error(err.detail || err.error || `HTTP ${res.status}`);
+    }
+    return res.json();
+  }
+
+  // --- Health check ---
+  async function checkHealth() {
+    try {
+      const data = await api('GET', '/api/v1/health');
+      headerTitle.className = 'connected';
+      serverStatus.textContent = `v${data.version} - ${data.status}`;
+      return true;
+    } catch {
+      headerTitle.className = 'disconnected';
+      serverStatus.textContent = '서버 연결 실패';
+      return false;
+    }
+  }
+
+  // --- Load regions ---
+  async function loadRegions() {
+    try {
+      const data = await api('GET', '/api/v1/regions');
+      regionSelect.innerHTML = '';
+      if (data.regions.length === 0) {
+        regionSelect.innerHTML = '<option value="">사용 가능한 지역 없음</option>';
+        return;
+      }
+      data.regions.forEach(r => {
+        const opt = document.createElement('option');
+        opt.value = r.name;
+        opt.textContent = `${r.name_kr} (${r.name_en})`;
+        if (!r.available) {
+          opt.textContent += ' - 데이터 없음';
+          opt.disabled = true;
+        }
+        regionSelect.appendChild(opt);
+      });
+      btnAnalyze.disabled = false;
+    } catch {
+      regionSelect.innerHTML = '<option value="">지역 목록 로드 실패</option>';
+    }
+  }
+
+  // --- Start analysis ---
+  async function startAnalysis() {
+    const region = regionSelect.value;
+    if (!region) return;
+
+    btnAnalyze.disabled = true;
+    btnAnalyze.textContent = '요청 중...';
+
+    try {
+      const data = await api('POST', '/api/v1/analyze', {
+        region,
+        skip_knowledge_extraction: !chkExtract.checked,
+        skip_review: chkSkipReview.checked
+      });
+
+      currentTaskId = data.task_id;
+
+      // Show progress
+      progressSection.style.display = 'block';
+      resultsSection.style.display = 'none';
+      progressFill.style.width = '0%';
+      progressText.textContent = '분석 시작됨...';
+      renderSteps(null, 'pending');
+
+      startPolling();
+    } catch (e) {
+      alert('분석 요청 실패: ' + e.message);
+    } finally {
+      btnAnalyze.textContent = '분석 시작';
+      btnAnalyze.disabled = false;
+    }
+  }
+
+  // --- Polling ---
+  function startPolling() {
+    stopPolling();
+    pollStatus();
+    pollTimer = setInterval(pollStatus, 2000);
+  }
+
+  function stopPolling() {
+    if (pollTimer) {
+      clearInterval(pollTimer);
+      pollTimer = null;
+    }
+  }
+
+  async function pollStatus() {
+    if (!currentTaskId) return;
+
+    try {
+      const data = await api('GET', `/api/v1/status/${currentTaskId}`);
+      const pct = data.progress != null ? Math.round(data.progress * 100) : 0;
+      progressFill.style.width = pct + '%';
+
+      const stepLabel = data.current_step ? (STEP_NAMES[data.current_step] || data.current_step) : '';
+      progressText.textContent = `${pct}%` + (stepLabel ? ` - ${stepLabel} 진행 중` : '');
+
+      renderSteps(data.current_step, data.status);
+
+      if (data.status === 'completed') {
+        stopPolling();
+        progressText.textContent = '100% - 완료';
+        progressFill.style.width = '100%';
+        await loadResults(currentTaskId);
+        resultsSection.scrollIntoView({ behavior: 'smooth' });
+        loadTasks();
+      } else if (data.status === 'failed') {
+        stopPolling();
+        progressText.textContent = '실패: ' + (data.error || '알 수 없는 오류');
+        progressFill.style.background = 'var(--danger)';
+        renderSteps(data.current_step, 'failed');
+        loadTasks();
+        btnAnalyze.disabled = false;
+      }
+    } catch {
+      // Ignore transient errors
+    }
+  }
+
+  function renderSteps(currentStep, taskStatus) {
+    const currentIdx = currentStep ? STEP_ORDER.indexOf(currentStep) : -1;
+    stepsRow.innerHTML = STEP_ORDER.map((key, i) => {
+      let cls = 'pending';
+      if (taskStatus === 'failed' && i === currentIdx) {
+        cls = 'failed';
+      } else if (taskStatus === 'completed' || i < currentIdx) {
+        cls = 'completed';
+      } else if (i === currentIdx) {
+        cls = 'running';
+      }
+      return `<span class="step ${cls}"><span class="step-icon"></span>${STEP_NAMES[key]}</span>`;
+    }).join('');
+  }
+
+  // --- Results ---
+  async function loadResults(taskId) {
+    try {
+      const data = await api('GET', `/api/v1/results/${taskId}`);
+      resultsSection.style.display = 'block';
+      btnAnalyze.disabled = false;
+
+      let html = '';
+
+      // Summary
+      if (data.summary) {
+        html += `<div class="result-summary">${escHtml(data.summary)}`;
+        if (data.review_summary) {
+          html += `<br><small>검토: ${data.review_summary.total_reviewed}개 검토, 평균 ${data.review_summary.average_score.toFixed(1)}/10`;
+          if (data.review_summary.critical_issues_count > 0) {
+            html += `, 주요 이슈 ${data.review_summary.critical_issues_count}건`;
+          }
+          html += '</small>';
+        }
+        html += '</div>';
+      }
+
+      // Error
+      if (data.status === 'failed') {
+        html += `<div class="error-msg">분석 실패</div>`;
+        resultsContent.innerHTML = html;
+        return;
+      }
+
+      // Images
+      if (data.outputs && data.outputs.cross_sections && data.outputs.cross_sections.length > 0) {
+        html += '<div class="image-grid">';
+        data.outputs.cross_sections.forEach(rawSrc => {
+          const src = toFileUrl(rawSrc);
+          const name = rawSrc.split(/[/\\]/).pop().replace(/\.[^.]+$/, '');
+          html += `<div class="image-card" onclick="showLightbox('${escAttr(src)}')">
+            <img src="${escAttr(src)}" alt="${escAttr(name)}" loading="lazy" onerror="this.style.display='none'">
+            <div class="image-label">${escHtml(name)}</div>
+          </div>`;
+        });
+        html += '</div>';
+      }
+
+      // Action buttons
+      const actions = [];
+      if (data.outputs && data.outputs.report) {
+        actions.push(`<a class="btn btn-sm btn-outline" href="${escAttr(toFileUrl(data.outputs.report))}" target="_blank">보고서 열기</a>`);
+      }
+      if (data.outputs && data.outputs.review_report) {
+        actions.push(`<a class="btn btn-sm btn-outline" href="${escAttr(toFileUrl(data.outputs.review_report))}" target="_blank">검토 보고서 열기</a>`);
+      }
+      if (actions.length > 0) {
+        html += `<div class="result-actions">${actions.join('')}</div>`;
+      }
+
+      if (!html) {
+        html = '<div class="empty-state">결과 데이터가 없습니다.</div>';
+      }
+
+      resultsContent.innerHTML = html;
+    } catch (e) {
+      resultsSection.style.display = 'block';
+      resultsContent.innerHTML = `<div class="error-msg">결과 로드 실패: ${escHtml(e.message)}</div>`;
+    }
+  }
+
+  // --- Task history ---
+  async function loadTasks() {
+    try {
+      const data = await api('GET', '/api/v1/tasks');
+      if (!data.tasks || data.tasks.length === 0) {
+        taskHistory.innerHTML = '<div class="empty-state">작업 이력이 없습니다.</div>';
+        return;
+      }
+
+      // Sort by created_at descending
+      const sorted = data.tasks.sort((a, b) => new Date(b.created_at) - new Date(a.created_at));
+
+      let html = '<table class="task-table"><thead><tr>';
+      html += '<th>Task ID</th><th>지역</th><th>상태</th><th>생성일시</th><th></th>';
+      html += '</tr></thead><tbody>';
+
+      sorted.forEach(t => {
+        const shortId = t.task_id.substring(0, 8) + '...';
+        const created = t.created_at ? formatDate(t.created_at) : '-';
+        html += `<tr>
+          <td class="task-id-cell" title="${escAttr(t.task_id)}">${escHtml(shortId)}</td>
+          <td>${escHtml(t.region)}</td>
+          <td><span class="status-badge ${t.status}">${escHtml(t.status)}</span></td>
+          <td>${escHtml(created)}</td>
+          <td>`;
+        if (t.status === 'completed') {
+          html += `<button class="btn btn-sm btn-outline" onclick="viewResult('${escAttr(t.task_id)}')">결과 보기</button>`;
+        } else if (t.status === 'running' || t.status === 'pending') {
+          html += `<button class="btn btn-sm btn-outline" onclick="trackTask('${escAttr(t.task_id)}')">추적</button>`;
+        }
+        html += '</td></tr>';
+      });
+
+      html += '</tbody></table>';
+      taskHistory.innerHTML = html;
+    } catch {
+      taskHistory.innerHTML = '<div class="empty-state">이력 로드 실패</div>';
+    }
+  }
+
+  // --- Lightbox ---
+  window.showLightbox = function(src) {
+    lightboxImg.src = src;
+    lightbox.classList.add('active');
+  };
+
+  lightbox.addEventListener('click', () => {
+    lightbox.classList.remove('active');
+    lightboxImg.src = '';
+  });
+
+  document.addEventListener('keydown', e => {
+    if (e.key === 'Escape') {
+      lightbox.classList.remove('active');
+      lightboxImg.src = '';
+    }
+  });
+
+  // --- Task actions from history ---
+  window.viewResult = async function(taskId) {
+    currentTaskId = taskId;
+    progressSection.style.display = 'none';
+    await loadResults(taskId);
+    resultsSection.scrollIntoView({ behavior: 'smooth' });
+  };
+
+  window.trackTask = function(taskId) {
+    currentTaskId = taskId;
+    progressSection.style.display = 'block';
+    resultsSection.style.display = 'none';
+    progressFill.style.background = '';
+    startPolling();
+    progressSection.scrollIntoView({ behavior: 'smooth' });
+  };
+
+  // --- Helpers ---
+  function toFileUrl(path) {
+    if (!path) return '';
+    if (path.startsWith('/') || path.startsWith('http')) return path;
+    // output/ 이하 상대경로 추출 (예: D:\...\output\Busan\file.png → Busan/file.png)
+    const outputIdx = path.replace(/\\/g, '/').indexOf('/output/');
+    if (outputIdx >= 0) {
+      const relPath = path.replace(/\\/g, '/').substring(outputIdx + '/output/'.length);
+      return '/files/' + relPath.split('/').map(encodeURIComponent).join('/');
+    }
+    const name = path.split(/[/\\]/).pop();
+    return '/files/' + encodeURIComponent(name);
+  }
+
+  function escHtml(str) {
+    const d = document.createElement('div');
+    d.textContent = str || '';
+    return d.innerHTML;
+  }
+
+  function escAttr(str) {
+    return (str || '').replace(/&/g, '&amp;').replace(/"/g, '&quot;').replace(/'/g, '&#39;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+  }
+
+  function formatDate(iso) {
+    try {
+      const d = new Date(iso);
+      const pad = n => String(n).padStart(2, '0');
+      return `${d.getFullYear()}-${pad(d.getMonth()+1)}-${pad(d.getDate())} ${pad(d.getHours())}:${pad(d.getMinutes())}`;
+    } catch {
+      return iso;
+    }
+  }
+
+  // --- Init ---
+  btnAnalyze.addEventListener('click', startAnalysis);
+
+  async function init() {
+    const healthy = await checkHealth();
+    if (healthy) {
+      await loadRegions();
+    }
+    await loadTasks();
+
+    // Periodic health check
+    setInterval(checkHealth, 30000);
+    // Periodic task list refresh
+    setInterval(loadTasks, 15000);
+  }
+
+  init();
+})();
+</script>
+</body>
+</html>
