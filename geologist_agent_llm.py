@@ -5,7 +5,10 @@ LLM 기반 지하구조 추정 에이전트
 
 import sys
 import io
-sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding='utf-8')
+try:
+    sys.stdout.reconfigure(encoding='utf-8')
+except (AttributeError, io.UnsupportedOperation):
+    pass
 
 import json
 import numpy as np

@@ -6,7 +6,10 @@ AI 분석 결과를 단면도에 적용 및 HTML 보고서 생성
 import os
 import sys
 import io
-sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding='utf-8')
+try:
+    sys.stdout.reconfigure(encoding='utf-8')
+except (AttributeError, io.UnsupportedOperation):
+    pass
 
 import json
 import numpy as np
@@ -125,6 +128,41 @@ def _load_kb_module():
         if 'geological_knowledge' in name and hasattr(mod, 'ROCK_UNITS'):
             return mod
     return None
+
+
+# 관입암 공통 DB (지역이 늘어나면서 누적됨)
+# KB 동적 판정에서 발견된 관입암도 여기에 자동 추가
+INTRUSIVE_ROCKS_DB = {
+    # Seoul
+    'Pgr', 'Jbgr', 'Kqp', 'Kqv', 'Kfl',
+    # Busan
+    'Kbgr', 'Khgdi', 'Kga', 'Kgp', 'Kad', 'Krh', 'Krt', 'Krb', 'Krwt',
+}
+
+
+def _is_intrusive_rock(litho_code):
+    """암석 자체가 관입암인지 판정 (이웃 암석 무관).
+
+    판정 순서:
+      1. 하드코딩 DB (서울+부산 누적) — 빠른 조회
+      2. KB 동적 조회 (expected_contact_type == 'intrusive')
+         → 발견 시 하드코딩 DB에 자동 추가 (다음 호출부터 빠른 경로)
+    """
+    if litho_code in INTRUSIVE_ROCKS_DB:
+        return True
+
+    kb = _load_kb_module()
+    if kb:
+        mapping = getattr(kb, 'LITHOIDX_TO_KB', {})
+        kb_code = mapping.get(litho_code, litho_code)
+        rock_units = getattr(kb, 'ROCK_UNITS', {})
+        if kb_code in rock_units:
+            if rock_units[kb_code].get('expected_contact_type') == 'intrusive':
+                INTRUSIVE_ROCKS_DB.add(litho_code)
+                print(f"  [KB] '{litho_code}' → intrusive rock (added to DB, total: {len(INTRUSIVE_ROCKS_DB)})")
+                return True
+
+    return False
 
 
 def _parse_dip_range(dip_range_str):
@@ -765,9 +803,8 @@ def create_section_figure(section, profile_data, projections, output_name):
         intrusion_shape = proj.get('intrusion_shape')
         contact_type = proj.get('contact_type', 'unknown')
 
-        # 관입암 판별
-        intrusive_rocks = {'Pgr', 'Jbgr', 'Kqp', 'Kqv', 'Kfl'}
-        is_intrusive = litho_code in intrusive_rocks or contact_type == 'intrusive'
+        # 관입암 판별 (KB 동적 + 하드코딩 DB + contact_type)
+        is_intrusive = _is_intrusive_rock(litho_code) or contact_type == 'intrusive'
 
         # 암체의 지표 폭 (관입체 확장 계산에 사용)
         unit_width = end_d - start_d

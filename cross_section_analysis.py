@@ -4,7 +4,10 @@ Seoul Geology Cross-Section Automation - Section Line Analysis
 
 import sys
 import io
-sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding='utf-8')
+try:
+    sys.stdout.reconfigure(encoding='utf-8')
+except (AttributeError, io.UnsupportedOperation):
+    pass
 
 import geopandas as gpd
 import rasterio
