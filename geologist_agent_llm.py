@@ -24,6 +24,14 @@ import yaml
 import os
 import sys
 
+# 범용 지질학 원리 모듈
+try:
+    from geological_principles import generate_principles_context
+    PRINCIPLES_LOADED = True
+except ImportError:
+    generate_principles_context = None
+    PRINCIPLES_LOADED = False
+
 # Load configuration (supports CLI arguments: --config, --data-dir, --output-dir, --dem-file)
 from config_loader import init_config
 
@@ -319,6 +327,7 @@ class LLMGeologistAgent:
         print(f"  Max boundaries to analyze: {self.max_boundaries}")
         print(f"  System persona: {'Loaded' if self.system_prompt else 'Not configured'}")
         print(f"  Knowledge base: {'Loaded' if KNOWLEDGE_BASE_LOADED else 'Default context only'}")
+        print(f"  Geological principles: {'Loaded' if PRINCIPLES_LOADED else 'Not available'}")
 
     def load_data(self):
         """Load geological data"""
@@ -333,6 +342,17 @@ class LLMGeologistAgent:
         prompt = f"""## Regional Geological Context
 {GEOLOGICAL_CONTEXT}
 """
+        # Add universal geological principles
+        if PRINCIPLES_LOADED and generate_principles_context:
+            lithologies = boundary_data.get('adjacent_lithologies', [])
+            principles_text = generate_principles_context(
+                rock_codes=lithologies, region_name=REGION_NAME_KR
+            )
+            prompt += f"""
+## 범용 지질학 원리 (Universal Geological Principles)
+{principles_text}
+"""
+
         # Add dynamic knowledge base context if available
         if KNOWLEDGE_BASE_LOADED and generate_context_for_boundary:
             lithologies = boundary_data.get('adjacent_lithologies', [])
@@ -406,7 +426,7 @@ Provide your analysis in the following JSON format:
         "description": "<습곡 영향 설명>"
     },
 
-    "reasoning": "<detailed geological reasoning for your estimate, in Korean>"
+    "reasoning": "<(적용 원리) + (지역 데이터 근거) → (결론) 형식으로 상세 추론, 한국어>"
 }
 ```
 

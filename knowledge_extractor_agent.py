@@ -494,6 +494,8 @@ You must output valid Python code that defines the following data structures:
    - structure: Structural characteristics (foliation, etc.)
    - expected_dip_range: Typical dip angle range (e.g., "40-70°")
    - expected_contact_type: "conformable", "intrusive", or "unconformable"
+   - body_geometry: "batholith", "stock", "laccolith", "volcanic_neck", "dike", "sill", "flow", or "conformable"
+     (산출 형태. 심성암: batholith/stock, 천부관입: laccolith/sill, 맥상: dike, 화산암경: volcanic_neck, 화산암: flow, 퇴적/변성암: conformable)
 
 2. **STRUCTURAL_GEOLOGY**: Regional structural information
    - regional_setting: Location, dominant trends

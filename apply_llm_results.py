@@ -26,6 +26,14 @@ import base64
 from io import BytesIO
 from datetime import datetime
 
+# 범용 지질학 원리 모듈 (한반도 제외 형태 검증용)
+try:
+    from geological_principles import KOREA_SPECIFIC_EXCLUSIONS
+    PRINCIPLES_AVAILABLE = True
+except ImportError:
+    KOREA_SPECIFIC_EXCLUSIONS = {}
+    PRINCIPLES_AVAILABLE = False
+
 # Load configuration (supports CLI arguments: --config, --data-dir, --output-dir, --dem-file)
 from config_loader import init_config
 
@@ -130,39 +138,69 @@ def _load_kb_module():
     return None
 
 
-# 관입암 공통 DB (지역이 늘어나면서 누적됨)
-# KB 동적 판정에서 발견된 관입암도 여기에 자동 추가
-INTRUSIVE_ROCKS_DB = {
-    # Seoul
-    'Pgr', 'Jbgr', 'Kqp', 'Kqv', 'Kfl',
-    # Busan
-    'Kbgr', 'Khgdi', 'Kga', 'Kgp', 'Kad', 'Krh', 'Krt', 'Krb', 'Krwt',
-}
+# body_geometry 캐시 (반복 호출 최적화)
+_BODY_GEOMETRY_CACHE = {}
 
 
-def _is_intrusive_rock(litho_code):
-    """암석 자체가 관입암인지 판정 (이웃 암석 무관).
+def _validate_korea_geometry(geo):
+    """한반도 제외 형태 검증. 부적용 형태이면 안전한 기본값으로 대체."""
+    if geo in KOREA_SPECIFIC_EXCLUSIONS:
+        fallback = KOREA_SPECIFIC_EXCLUSIONS[geo].get('safe_fallback', 'stock')
+        return fallback
+    return geo
 
-    판정 순서:
-      1. 하드코딩 DB (서울+부산 누적) — 빠른 조회
-      2. KB 동적 조회 (expected_contact_type == 'intrusive')
-         → 발견 시 하드코딩 DB에 자동 추가 (다음 호출부터 빠른 경로)
+
+def _get_body_geometry(litho_code, intrusion_shape=None, unit_width=None):
+    """암체의 산출 형태를 판정.
+
+    판정 우선순위:
+      1. LLM 분석 결과 intrusion_shape (가장 높은 우선순위)
+      2. KB body_geometry (새 필드)
+      3. KB expected_contact_type == 'intrusive' → 크기 기반 휴리스틱
+      4. 기본값: 'conformable'
+
+    모든 결과는 한반도 부적용 형태(lopolith, phacolith) 검증을 거침.
+
+    Returns: 'batholith'|'stock'|'dome'|'plug'|'dike'|'sill'|'flow'|'conformable'
     """
-    if litho_code in INTRUSIVE_ROCKS_DB:
-        return True
+    # 1) LLM 분석 결과 (가장 높은 우선순위)
+    if intrusion_shape and intrusion_shape != 'null' and intrusion_shape != 'unknown':
+        return _validate_korea_geometry(intrusion_shape)
 
+    # 캐시 확인 (LLM 결과 없는 경우에만)
+    if litho_code in _BODY_GEOMETRY_CACHE:
+        return _BODY_GEOMETRY_CACHE[litho_code]
+
+    # 2) KB body_geometry
     kb = _load_kb_module()
     if kb:
         mapping = getattr(kb, 'LITHOIDX_TO_KB', {})
         kb_code = mapping.get(litho_code, litho_code)
         rock_units = getattr(kb, 'ROCK_UNITS', {})
         if kb_code in rock_units:
+            geo = rock_units[kb_code].get('body_geometry')
+            if geo:
+                geo = _validate_korea_geometry(geo)
+                _BODY_GEOMETRY_CACHE[litho_code] = geo
+                return geo
+            # body_geometry가 없으면 expected_contact_type으로 추정
             if rock_units[kb_code].get('expected_contact_type') == 'intrusive':
-                INTRUSIVE_ROCKS_DB.add(litho_code)
-                print(f"  [KB] '{litho_code}' → intrusive rock (added to DB, total: {len(INTRUSIVE_ROCKS_DB)})")
-                return True
+                # 3) 크기 기반 휴리스틱
+                if unit_width is not None:
+                    if unit_width < 200:
+                        geo = 'dike'
+                    elif unit_width > 2000:
+                        geo = 'batholith'
+                    else:
+                        geo = 'stock'
+                else:
+                    geo = 'stock'  # 관입암 기본
+                _BODY_GEOMETRY_CACHE[litho_code] = geo
+                return geo
 
-    return False
+    # 4) 기본값
+    _BODY_GEOMETRY_CACHE[litho_code] = 'conformable'
+    return 'conformable'
 
 
 def _parse_dip_range(dip_range_str):
@@ -327,9 +365,10 @@ def get_dip_for_litho_pair(litho1, litho2, llm_results):
         intrusive_rocks = {'Pgr', 'Jbgr', 'Kqp', 'Kqv', 'Kfl'}
         quaternary = {'Qa', 'Qal'}
         metamorphic = {'PCEbngn', 'PCEggn', 'PCEls', 'PCEqz', 'PCEam'}
-        # Busan region rocks (accumulated from previous analyses)
-        intrusive_rocks |= {'Kbgr', 'Khgdi', 'Kga', 'Kgp', 'Kad', 'Krh', 'Krt', 'Krb', 'Krwt'}
-        conformable_volcanic = {'Kan', 'Kanb', 'Kts', 'Kdban', 'Kdlw', 'Kdtb', 'Kdup'}
+        # Busan region rocks - 심성암/맥암만 (화산암은 conformable_volcanic로)
+        intrusive_rocks |= {'Kbgr', 'Khgdi', 'Kga', 'Kgp', 'Kad'}
+        conformable_volcanic = {'Kan', 'Kanb', 'Kts', 'Kdban', 'Kdlw', 'Kdtb', 'Kdup',
+                                'Krb', 'Krwt', 'Krt', 'Krh'}
 
         if litho1 in quaternary or litho2 in quaternary:
             expected_type = 'unconformable'
@@ -363,7 +402,7 @@ def get_dip_for_litho_pair(litho1, litho2, llm_results):
     elif expected_type == 'intrusive':
         angle = kb_dip or 75
         return {**default_info, 'dip_angle': angle, 'dip_direction': 135, 'contact_type': 'intrusive',
-                'contact_geometry': 'curved', 'depth_behavior': 'flattening', 'intrusion_shape': 'stock'}
+                'contact_geometry': 'curved', 'depth_behavior': 'flattening'}
     elif expected_type == 'conformable':
         angle = kb_dip or 30
         return {**default_info, 'dip_angle': angle, 'dip_direction': 135, 'contact_type': 'conformable'}
@@ -534,7 +573,7 @@ def add_natural_irregularity(coords, amplitude=20, frequency=3):
     return list(zip(x_coords, y_coords))
 
 
-def generate_intrusion_boundary(start_d, start_e, min_elev, base_dip, is_left_boundary, length, unit_width=None):
+def generate_intrusion_boundary(start_d, start_e, min_elev, base_dip, is_left_boundary, length, unit_width=None, expansion_factor=1.5):
     """
     Generate realistic intrusion boundary (batholith/stock shape).
 
@@ -546,6 +585,7 @@ def generate_intrusion_boundary(start_d, start_e, min_elev, base_dip, is_left_bo
     Args:
         is_left_boundary: True면 왼쪽 경계, False면 오른쪽 경계
         unit_width: 암체의 지표 폭 (심부 확장 계산에 사용)
+        expansion_factor: 심부 확장 배율 (batholith=5, stock=3)
     """
     total_depth = start_e - min_elev
     num_points = 60
@@ -558,9 +598,9 @@ def generate_intrusion_boundary(start_d, start_e, min_elev, base_dip, is_left_bo
     x_coords = [start_d]
     y_coords = [start_e]
 
-    # 심부 확장량 (지표 폭의 100-200%)
+    # 심부 확장량 (expansion_factor에 의해 조절)
     effective_width = unit_width or 1000
-    max_expansion = effective_width * 1.5
+    max_expansion = effective_width * expansion_factor
 
     # 경사 변화 마일스톤 (surface_dip 기반으로 동적 계산)
     mid_dip = surface_dip * 0.5       # 중부: 표면 경사의 50%
@@ -607,6 +647,202 @@ def generate_intrusion_boundary(start_d, start_e, min_elev, base_dip, is_left_bo
 
     # 강한 불규칙성 추가 (자연스러운 관입체 경계)
     return add_natural_irregularity(coords, amplitude=100, frequency=3)
+
+
+def generate_laccolith_boundary(start_d, start_e, min_elev, base_dip, is_left_boundary, length, unit_width=None):
+    """
+    Generate laccolith (병반) boundary.
+
+    Laccolith 단면:
+    - 상부: 외향 확장 (돔이 상부 지층을 밀어올린 형태)
+    - 하부: 평탄 바닥 (원래 층리면, 기울어진 지층을 따라감)
+
+    경계 이동 = 돔 확장(expansion) + 구조 기울기(tilt)
+    - expansion: is_left_boundary에 의해 외향 (돔 형태)
+    - tilt: base_dip 부호에 의해 전체 암체 기울기 (주변 지층 경사 반영)
+
+    |base_dip| → 표면 돔 시작 각도 (35°~75°)
+    sign(base_dip) → 구조 기울기 방향 (양수=좌, 음수=우)
+    """
+    total_depth = start_e - min_elev
+    num_points = 50
+
+    effective_width = unit_width or 800
+
+    # 표면 돔 시작 각도: |base_dip| 기반 (35°~75° 범위)
+    surface_dip = max(35, min(75, abs(base_dip))) if base_dip else 55
+
+    # 구조 기울기 (주변 지층 경사를 따라 전체 암체가 기울어짐)
+    tilt_factor = 0.3
+    if base_dip and abs(base_dip) > 5:
+        tilt_per_depth = tilt_factor / np.tan(np.radians(abs(base_dip)))
+        tilt_sign = -1 if base_dip >= 0 else 1  # 양수 dip → 좌로 기울기
+    else:
+        tilt_per_depth = 0
+        tilt_sign = 0
+
+    depths = np.linspace(0, total_depth, num_points)
+    x_coords = [start_d]
+    y_coords = [start_e]
+
+    for i, depth in enumerate(depths[1:], 1):
+        progress = depth / total_depth
+
+        if progress < 0.4:
+            # 상부 40%: 외향 확장 (돔 부분) — surface_dip에서 점점 완만해짐
+            local_dip = surface_dip - progress * (surface_dip - 35)  # surface_dip → 35°
+            local_dip = max(35, local_dip)
+        elif progress < 0.6:
+            # 중부 20%: 거의 수직 (최대 폭 유지 → 바닥으로 전환)
+            local_dip = 85
+        else:
+            # 하부 40%: 거의 수직 (평탄 바닥 효과 — 수평 이동 최소화)
+            local_dip = 88
+
+        delta_depth = depths[i] - depths[i-1]
+
+        # 1. 돔 확장 (외향)
+        expansion_h = delta_depth / np.tan(np.radians(local_dip))
+        if is_left_boundary:
+            expansion_x = -expansion_h
+        else:
+            expansion_x = +expansion_h
+
+        # 2. 구조 기울기 (양쪽 경계 동일 방향)
+        tilt_x = tilt_sign * delta_depth * tilt_per_depth
+
+        # 3. 합산
+        new_x = x_coords[-1] + expansion_x + tilt_x
+
+        new_x = max(0, min(length, new_x))
+        new_y = start_e - depth
+        x_coords.append(new_x)
+        y_coords.append(new_y)
+
+    coords = list(zip(x_coords, y_coords))
+    return add_natural_irregularity(coords, amplitude=min(40, effective_width * 0.05), frequency=3)
+
+
+def generate_volcanic_neck_boundary(start_d, start_e, min_elev, base_dip, is_left_boundary, length, unit_width=None):
+    """
+    Generate volcanic neck (화산암경) boundary — 거의 수직 원통형.
+    plug과 동일한 형태.
+    """
+    return generate_plug_boundary(start_d, start_e, min_elev, base_dip, is_left_boundary, length, unit_width)
+
+
+def generate_plug_boundary(start_d, start_e, min_elev, base_dip, is_left_boundary, length, unit_width=None):
+    """
+    Generate volcanic plug boundary (nearly vertical, slight expansion).
+
+    화산암경(Plug) 형태:
+    - 거의 수직 (75-85°)
+    - 심부에서 미세하게 확장
+    - 불규칙한 경계
+
+    base_dip 부호로 구조 기울기 반영 (tilt_factor=0.15, plug은 수직성이 강해 tilt 영향 적음)
+    """
+    total_depth = start_e - min_elev
+    num_points = 40
+
+    effective_width = unit_width or 500
+
+    # 구조 기울기 (plug은 수직성이 강해 tilt 영향 적게)
+    tilt_factor = 0.15
+    if base_dip and abs(base_dip) > 5:
+        tilt_per_depth = tilt_factor / np.tan(np.radians(abs(base_dip)))
+        tilt_sign = -1 if base_dip >= 0 else 1
+    else:
+        tilt_per_depth = 0
+        tilt_sign = 0
+
+    depths = np.linspace(0, total_depth, num_points)
+    x_coords = [start_d]
+    y_coords = [start_e]
+
+    for i, depth in enumerate(depths[1:], 1):
+        progress = depth / total_depth
+
+        # 거의 수직, 심부에서 미세 확장
+        local_dip = 80 - progress * 8  # 80° → 72°
+
+        delta_depth = depths[i] - depths[i-1]
+
+        # 1. 외향 확장
+        expansion_h = delta_depth / np.tan(np.radians(local_dip))
+        if is_left_boundary:
+            expansion_x = -expansion_h
+        else:
+            expansion_x = +expansion_h
+
+        # 2. 구조 기울기
+        tilt_x = tilt_sign * delta_depth * tilt_per_depth
+
+        # 3. 합산
+        new_x = x_coords[-1] + expansion_x + tilt_x
+
+        new_x = max(0, min(length, new_x))
+        new_y = start_e - depth
+        x_coords.append(new_x)
+        y_coords.append(new_y)
+
+    coords = list(zip(x_coords, y_coords))
+    return add_natural_irregularity(coords, amplitude=30, frequency=4)
+
+
+def generate_dike_boundary(start_d, start_e, min_elev, base_dip, is_left_boundary, length, unit_width=None):
+    """
+    Generate dike boundary (vertical, constant width).
+
+    암맥(Dike) 형태:
+    - 완전 수직 또는 거의 수직 (85-90°)
+    - 폭 유지 (확장 없음)
+    - 약간의 자연 굴곡만
+
+    base_dip 부호로 구조 기울기 반영 (tilt_factor=0.2)
+    """
+    total_depth = start_e - min_elev
+    num_points = 30
+
+    # 구조 기울기
+    tilt_factor = 0.2
+    if base_dip and abs(base_dip) > 5:
+        tilt_per_depth = tilt_factor / np.tan(np.radians(abs(base_dip)))
+        tilt_sign = -1 if base_dip >= 0 else 1
+    else:
+        tilt_per_depth = 0
+        tilt_sign = 0
+
+    depths = np.linspace(0, total_depth, num_points)
+    x_coords = [start_d]
+    y_coords = [start_e]
+
+    for i, depth in enumerate(depths[1:], 1):
+        # 거의 수직 (87°) - 약간의 경사만
+        local_dip = 87
+
+        delta_depth = depths[i] - depths[i-1]
+
+        # 1. 미세 외향 확장
+        expansion_h = delta_depth / np.tan(np.radians(local_dip))
+        if is_left_boundary:
+            expansion_x = -expansion_h
+        else:
+            expansion_x = +expansion_h
+
+        # 2. 구조 기울기
+        tilt_x = tilt_sign * delta_depth * tilt_per_depth
+
+        # 3. 합산
+        new_x = x_coords[-1] + expansion_x + tilt_x
+
+        new_x = max(0, min(length, new_x))
+        new_y = start_e - depth
+        x_coords.append(new_x)
+        y_coords.append(new_y)
+
+    coords = list(zip(x_coords, y_coords))
+    return add_natural_irregularity(coords, amplitude=15, frequency=5)
 
 
 def generate_metamorphic_boundary(start_d, start_e, min_elev, app_dip, length):
@@ -661,21 +897,28 @@ def generate_metamorphic_boundary(start_d, start_e, min_elev, app_dip, length):
     return add_natural_irregularity(coords, amplitude=40, frequency=3)
 
 
-def generate_curved_boundary(start_d, start_e, min_elev, app_dip, depth_behavior, depth_to_flatten, contact_geometry, intrusion_shape, length, contact_type=None, is_left=True, unit_width=None):
+def generate_curved_boundary(start_d, start_e, min_elev, app_dip, depth_behavior, depth_to_flatten, contact_geometry, intrusion_shape, length, contact_type=None, is_left=True, unit_width=None, body_geometry='conformable'):
     """
-    Generate curved boundary path based on rock type and contact relationship.
+    Generate curved boundary path based on body geometry and contact relationship.
 
     Args:
         contact_type: 'intrusive', 'conformable', 'unconformable', etc.
         is_left: True if this is the left boundary of a rock unit
         unit_width: Width of the rock unit at surface (for intrusion expansion calc)
+        body_geometry: 'batholith'|'stock'|'dome'|'plug'|'dike'|'sill'|'flow'|'conformable'
     """
-    # 관입 접촉인 경우 특수 처리
-    if contact_type == 'intrusive' or intrusion_shape in ['batholith', 'stock', 'dome']:
-        return generate_intrusion_boundary(start_d, start_e, min_elev, app_dip, is_left, length, unit_width=unit_width)
-
-    # 정합 접촉 (변성암) 처리
-    if contact_type == 'conformable':
+    # body_geometry 기반 라우팅
+    if body_geometry == 'batholith':
+        return generate_intrusion_boundary(start_d, start_e, min_elev, app_dip, is_left, length, unit_width=unit_width, expansion_factor=5)
+    elif body_geometry == 'stock':
+        return generate_intrusion_boundary(start_d, start_e, min_elev, app_dip, is_left, length, unit_width=unit_width, expansion_factor=3)
+    elif body_geometry == 'laccolith':
+        return generate_laccolith_boundary(start_d, start_e, min_elev, app_dip, is_left, length, unit_width=unit_width)
+    elif body_geometry in ('plug', 'volcanic_neck'):
+        return generate_plug_boundary(start_d, start_e, min_elev, app_dip, is_left, length, unit_width=unit_width)
+    elif body_geometry == 'dike':
+        return generate_dike_boundary(start_d, start_e, min_elev, app_dip, is_left, length, unit_width=unit_width)
+    elif body_geometry in ('flow', 'conformable', 'sill'):
         return generate_metamorphic_boundary(start_d, start_e, min_elev, app_dip, length)
 
     # 기본 처리 (기존 로직 개선)
@@ -803,37 +1046,57 @@ def create_section_figure(section, profile_data, projections, output_name):
         intrusion_shape = proj.get('intrusion_shape')
         contact_type = proj.get('contact_type', 'unknown')
 
-        # 관입암 판별 (KB 동적 + 하드코딩 DB + contact_type)
-        is_intrusive = _is_intrusive_rock(litho_code) or contact_type == 'intrusive'
-
         # 암체의 지표 폭 (관입체 확장 계산에 사용)
         unit_width = end_d - start_d
 
-        # 관입암은 항상 intrusive 접촉 타입 사용 (LLM 결과와 무관)
-        effective_contact_type = 'intrusive' if is_intrusive else 'conformable'
+        # 암체 형태 판정 (LLM → KB → 휴리스틱 → conformable)
+        body_geo = _get_body_geometry(litho_code, intrusion_shape, unit_width)
+        is_non_conformable = body_geo not in ('flow', 'conformable', 'sill')
 
-        # 곡선 경계 생성 - 관입체는 좌우가 외향으로 경사
+        # 곡선 경계 생성 - body_geometry에 따라 형태별 분기
         left_curve = generate_curved_boundary(
             start_d, start_e, min_elev, app_dip,
             depth_behavior, depth_to_flatten, contact_geometry, intrusion_shape, length,
-            contact_type=effective_contact_type,
+            contact_type=contact_type,
             is_left=True,
-            unit_width=unit_width
+            unit_width=unit_width,
+            body_geometry=body_geo
         )
         right_curve = generate_curved_boundary(
             end_d, end_e, min_elev, app_dip,
             depth_behavior, depth_to_flatten, contact_geometry, intrusion_shape, length,
-            contact_type=effective_contact_type,
-            is_left=False,  # 오른쪽 경계는 오른쪽으로 경사 (외향)
-            unit_width=unit_width
+            contact_type=contact_type,
+            is_left=False,
+            unit_width=unit_width,
+            body_geometry=body_geo
         )
 
         poly_x = [p[0] for p in left_curve] + [p[0] for p in reversed(right_curve)]
         poly_y = [p[1] for p in left_curve] + [p[1] for p in reversed(right_curve)]
 
-        # 암체 폴리곤 그리기 - 검정 테두리로 각 암체를 명확히 구분
-        ax1.fill(poly_x, poly_y, color=color, alpha=alpha,
-                edgecolor='black', linewidth=0.8, label=label, zorder=poly_zorder)
+        # 암체 폴리곤 그리기 - body_geometry별 테두리 색상/스타일
+        if body_geo in ('batholith', 'stock'):
+            edge_color = CONTACT_COLORS.get('intrusive', '#FF4444')
+            edge_width = 2.5
+        elif body_geo in ('laccolith', 'plug', 'volcanic_neck'):
+            edge_color = '#FF8C00'  # 주황색 (subvolcanic)
+            edge_width = 2.0
+        elif body_geo == 'dike':
+            edge_color = CONTACT_COLORS.get('intrusive', '#FF4444')
+            edge_width = 1.5
+        else:
+            edge_color = 'black'
+            edge_width = 0.8
+
+        # dike는 점선 테두리
+        if body_geo == 'dike':
+            ax1.fill(poly_x, poly_y, color=color, alpha=alpha,
+                    edgecolor=edge_color, linewidth=edge_width, linestyle='--',
+                    label=label, zorder=poly_zorder)
+        else:
+            ax1.fill(poly_x, poly_y, color=color, alpha=alpha,
+                    edgecolor=edge_color, linewidth=edge_width,
+                    label=label, zorder=poly_zorder)
 
         # 암체 내부에 암상 코드 라벨 추가 (폭이 충분한 경우)
         body_width = end_d - start_d
@@ -846,13 +1109,14 @@ def create_section_figure(section, profile_data, projections, output_name):
                     bbox=dict(facecolor=color, edgecolor='black', alpha=0.8,
                              boxstyle='round,pad=0.3'))
 
-        # 경계선 그리기 - 상부 500m만 표시 (너무 깊게 표시하면 혼란 유발)
+        # 경계선 그리기 (정합암만) - 상부 500m만 표시
+        # 비정합 암체는 폴리곤 테두리로 이미 표시됨
         contact_color = CONTACT_COLORS.get(proj['contact_type'], 'gray')
-        if proj['start_dist'] > 0:
+        max_boundary_depth = 500
+        if not is_non_conformable and proj['start_dist'] > 0:
             curve_x = [p[0] for p in left_curve]
             curve_y = [p[1] for p in left_curve]
             # 상부 500m까지만 경계선 표시 (최소 표고 기준)
-            max_boundary_depth = 500
             boundary_min_elev = start_e - max_boundary_depth
             clipped_x = [x for x, y in zip(curve_x, curve_y) if y >= boundary_min_elev]
             clipped_y = [y for y in curve_y if y >= boundary_min_elev]
